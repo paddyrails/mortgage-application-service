@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       cluster_name:
-        description: 'Cluster name'
+        description: "Cluster name"
         required: true
-        default: 'mortgage-test'
+        default: "mortgage-test"
       region:
-        description: 'AWS Region'
+        description: "AWS Region"
         required: true
-        default: 'us-east-1'
+        default: "us-east-1"
         type: choice
         options:
           - us-east-1
@@ -18,9 +18,9 @@ on:
           - us-west-2
           - eu-west-1
       instance_type:
-        description: 'Worker instance type'
+        description: "Worker instance type"
         required: true
-        default: 'm5.xlarge'
+        default: "m5.large"
         type: choice
         options:
           - m5.large
@@ -29,22 +29,22 @@ on:
           - t3.xlarge
           - t3.2xlarge
       worker_count:
-        description: 'Number of worker nodes'
+        description: "Number of worker nodes"
         required: true
-        default: '2'
+        default: "2"
       use_spot:
-        description: 'Use Spot Instances for workers'
+        description: "Use Spot Instances for workers"
         required: true
         default: true
         type: boolean
       spot_max_price:
-        description: 'Max price for Spot (e.g., 0.10 for $0.10/hr, or on-demand to use on-demand price)'
+        description: "Max price for Spot (e.g., 0.10 for $0.10/hr, or on-demand to use on-demand price)"
         required: false
-        default: 'on-demand'
+        default: "on-demand"
       openshift_version:
-        description: 'OpenShift version'
+        description: "OpenShift version"
         required: true
-        default: '4.14.12'
+        default: "4.14.12"
 
 env:
   AWS_REGION: ${{ github.event.inputs.region }}
@@ -53,7 +53,7 @@ jobs:
   create-cluster:
     name: Create ROSA Cluster
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -85,7 +85,7 @@ jobs:
         run: |
           echo "🔍 Verifying AWS quotas..."
           rosa verify quota --region=${{ env.AWS_REGION }}
-          
+
           echo "🔍 Verifying AWS permissions..."
           rosa verify permissions
 
@@ -104,7 +104,7 @@ jobs:
         if: steps.check-cluster.outputs.exists == 'false'
         run: |
           echo "🚀 Creating ROSA cluster: ${{ github.event.inputs.cluster_name }}"
-          
+
           # Create cluster with minimal default workers (we'll add spot pool after)
           rosa create cluster \
             --cluster-name=${{ github.event.inputs.cluster_name }} \
@@ -118,14 +118,14 @@ jobs:
             --host-prefix=23 \
             --multi-az=false \
             --yes
-          
+
           echo "⏳ Cluster creation initiated. This takes ~40 minutes."
 
       - name: Wait for cluster to be ready
         if: steps.check-cluster.outputs.exists == 'false'
         run: |
           echo "⏳ Waiting for cluster to be ready..."
-          
+
           # Poll every 2 minutes for up to 60 minutes
           for i in {1..30}; do
             STATUS=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.status.state')
@@ -142,7 +142,7 @@ jobs:
             
             sleep 120
           done
-          
+
           # Final check
           STATUS=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.status.state')
           if [ "$STATUS" != "ready" ]; then
@@ -154,7 +154,7 @@ jobs:
         if: github.event.inputs.use_spot == 'true'
         run: |
           echo "🎯 Creating Spot Instance machine pool..."
-          
+
           # Build the command
           SPOT_CMD="rosa create machinepool \
             --cluster=${{ github.event.inputs.cluster_name }} \
@@ -162,38 +162,38 @@ jobs:
             --instance-type=${{ github.event.inputs.instance_type }} \
             --replicas=${{ github.event.inputs.worker_count }} \
             --use-spot-instances"
-          
+
           # Add max price if specified and not 'on-demand'
           if [ "${{ github.event.inputs.spot_max_price }}" != "on-demand" ]; then
             SPOT_CMD="${SPOT_CMD} --spot-max-price=${{ github.event.inputs.spot_max_price }}"
           fi
-          
+
           # Add labels
           SPOT_CMD="${SPOT_CMD} --labels=node-type=spot,workload=mortgage-app"
-          
+
           # Execute
           eval $SPOT_CMD
-          
+
           echo "✅ Spot machine pool created"
 
       - name: Scale down default machine pool (if using spot)
         if: github.event.inputs.use_spot == 'true'
         run: |
           echo "⬇️ Scaling down default (on-demand) machine pool..."
-          
+
           # Scale default pool to 0 since we're using spot
           rosa edit machinepool \
             --cluster=${{ github.event.inputs.cluster_name }} \
             --replicas=0 \
             worker \
             || echo "Default pool may not exist or already scaled"
-          
+
           echo "✅ Default machine pool scaled down"
 
       - name: Create cluster admin user
         run: |
           echo "👤 Creating cluster admin user..."
-          
+
           # Check if admin already exists
           if rosa describe admin --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
             echo "Admin user already exists"
@@ -206,18 +206,18 @@ jobs:
         run: |
           echo "📊 Cluster Information:"
           echo ""
-          
+
           # Get cluster details
           rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }}
-          
+
           # Get API URL
           API_URL=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.api.url')
           echo "api_url=${API_URL}" >> $GITHUB_OUTPUT
-          
+
           # Get Console URL
           CONSOLE_URL=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.console.url')
           echo "console_url=${CONSOLE_URL}" >> $GITHUB_OUTPUT
-          
+
           echo ""
           echo "🖥️ Machine Pools:"
           rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
