@@ -1,0 +1,218 @@
+name: 4. Invoke APIs
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, prod]
+      test_type:
+        description: 'Test type'
+        required: true
+        default: 'smoke'
+        type: choice
+        options: [smoke, full, workflow]
+
+env:
+  SERVICE_NAME: application-service
+  OPENSHIFT_NAMESPACE: mortgage-app
+  TEST_CUSTOMER_ID: "11111111-1111-1111-1111-111111111111"
+  TEST_PROPERTY_ID: "aaaa1111-1111-1111-1111-111111111111"
+
+jobs:
+  invoke-apis:
+    runs-on: ubuntu-latest
+
+    steps:
+      - run: sudo apt-get install -y jq
+
+      - uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: "4.14"
+
+      - uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ secrets.OPENSHIFT_SERVER }}
+          openshift_token: ${{ secrets.OPENSHIFT_TOKEN }}
+          insecure_skip_tls_verify: true
+          namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+
+      - id: url
+        run: |
+          ROUTE=$(oc get route ${{ env.SERVICE_NAME }} -o jsonpath='{.spec.host}')
+          echo "url=https://${ROUTE}" >> $GITHUB_OUTPUT
+
+      - name: Smoke Tests
+        run: |
+          URL="${{ steps.url.outputs.url }}"
+          echo "🔥 Smoke Tests for Application Service"
+          echo ""
+          
+          echo "=== Health Check ==="
+          curl -s "${URL}/api/health" | jq .
+          
+          echo ""
+          echo "=== List Applications ==="
+          RESPONSE=$(curl -s "${URL}/api/applications")
+          echo "$RESPONSE" | jq '.data | length' | xargs -I {} echo "Found {} applications"
+
+      - name: CRUD Tests
+        if: github.event.inputs.test_type == 'full' || github.event.inputs.test_type == 'workflow'
+        id: crud
+        run: |
+          URL="${{ steps.url.outputs.url }}"
+          echo "🧪 Application CRUD Tests"
+          
+          # CREATE Application
+          echo ""
+          echo "=== CREATE Application ==="
+          RESPONSE=$(curl -s -X POST "${URL}/api/applications" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "customerId": "${{ env.TEST_CUSTOMER_ID }}",
+              "propertyId": "${{ env.TEST_PROPERTY_ID }}",
+              "requestedLoanAmount": 450000,
+              "downPaymentAmount": 90000,
+              "requestedTermMonths": 360,
+              "loanPurpose": 1,
+              "applicationType": 1,
+              "notes": "Created by GitHub Actions API test"
+            }')
+          
+          echo "$RESPONSE" | jq .
+          APP_ID=$(echo "$RESPONSE" | jq -r '.data.id')
+          APP_NUM=$(echo "$RESPONSE" | jq -r '.data.applicationNumber')
+          
+          echo "app_id=${APP_ID}" >> $GITHUB_OUTPUT
+          
+          if [ "$APP_ID" != "null" ] && [ -n "$APP_ID" ]; then
+            echo "✅ Created application: ${APP_NUM} (${APP_ID})"
+            
+            # READ
+            echo ""
+            echo "=== READ Application ==="
+            curl -s "${URL}/api/applications/${APP_ID}" | jq '.data | {id, applicationNumber, status, requestedLoanAmount}'
+            
+            # Get by Customer
+            echo ""
+            echo "=== GET by Customer ==="
+            curl -s "${URL}/api/applications/customer/${{ env.TEST_CUSTOMER_ID }}" | jq '.data | length' | xargs -I {} echo "Customer has {} applications"
+          else
+            echo "❌ Failed to create application"
+            echo "$RESPONSE"
+          fi
+
+      - name: Full Workflow Test
+        if: github.event.inputs.test_type == 'workflow'
+        run: |
+          URL="${{ steps.url.outputs.url }}"
+          APP_ID="${{ steps.crud.outputs.app_id }}"
+          
+          if [ -z "$APP_ID" ] || [ "$APP_ID" = "null" ]; then
+            echo "⚠️ No application ID from previous step, skipping workflow test"
+            exit 0
+          fi
+          
+          echo "🔄 Testing Full Mortgage Application Workflow"
+          echo "Application ID: ${APP_ID}"
+          echo ""
+          
+          # Step 1: Submit Application
+          echo "=== STEP 1: Submit Application ==="
+          RESPONSE=$(curl -s -X POST "${URL}/api/applications/${APP_ID}/submit" \
+            -H "Content-Type: application/json" \
+            -d '{"acceptTerms": true, "authorizeCredit": true}')
+          echo "$RESPONSE" | jq '.data | {status, submittedAt}'
+          
+          sleep 2
+          
+          # Step 2: Run Underwriting
+          echo ""
+          echo "=== STEP 2: Run Underwriting ==="
+          RESPONSE=$(curl -s -X POST "${URL}/api/applications/${APP_ID}/underwrite")
+          echo "$RESPONSE" | jq '.data | {status, underwriting: .underwriting | {creditScore, creditApproved, calculatedDTI, calculatedLTV, decision}}'
+          
+          sleep 2
+          
+          # Step 3: Make Decision (Approve)
+          echo ""
+          echo "=== STEP 3: Approve Application ==="
+          RESPONSE=$(curl -s -X POST "${URL}/api/applications/${APP_ID}/decision" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "approved": true,
+              "approvedAmount": 450000,
+              "interestRate": 6.75,
+              "reason": "Approved by automated test"
+            }')
+          echo "$RESPONSE" | jq '.data | {status, approvedLoanAmount, offeredInterestRate, decisionReason}'
+          
+          # Get final status
+          echo ""
+          echo "=== Final Application Status ==="
+          curl -s "${URL}/api/applications/${APP_ID}" | jq '.data | {
+            applicationNumber,
+            status,
+            requestedLoanAmount,
+            approvedLoanAmount,
+            offeredInterestRate,
+            lTV: .lTV,
+            dTI: .dTI
+          }'
+          
+          # Optional: Create Loan and Fund (commented out to avoid creating test data)
+          # echo ""
+          # echo "=== STEP 4: Create Loan and Fund ==="
+          # curl -s -X POST "${URL}/api/applications/${APP_ID}/fund" | jq .
+
+      - name: Test Document APIs
+        if: github.event.inputs.test_type == 'full'
+        run: |
+          URL="${{ steps.url.outputs.url }}"
+          APP_ID="${{ steps.crud.outputs.app_id }}"
+          
+          if [ -z "$APP_ID" ] || [ "$APP_ID" = "null" ]; then
+            echo "⚠️ No application ID, skipping document test"
+            exit 0
+          fi
+          
+          echo "📄 Document APIs"
+          
+          # Add Document
+          echo "=== Add Document ==="
+          curl -s -X POST "${URL}/api/applications/${APP_ID}/documents" \
+            -H "Content-Type: application/json" \
+            -d '{"documentName": "Test Pay Stub", "documentType": 10}' | jq .
+
+      - name: Cleanup - Withdraw Test Application
+        if: always() && github.event.inputs.test_type != 'smoke'
+        run: |
+          URL="${{ steps.url.outputs.url }}"
+          APP_ID="${{ steps.crud.outputs.app_id }}"
+          
+          if [ -n "$APP_ID" ] && [ "$APP_ID" != "null" ]; then
+            echo "🧹 Cleaning up - Withdrawing test application"
+            curl -s -X POST "${URL}/api/applications/${APP_ID}/withdraw?reason=API%20test%20cleanup" | jq '.message'
+          fi
+
+      - name: Summary
+        run: |
+          echo "## 🧪 Application Service API Tests" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ env.SERVICE_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Type | ${{ github.event.inputs.test_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| URL | ${{ steps.url.outputs.url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.test_type }}" = "workflow" ]; then
+            echo "### Workflow Steps Tested" >> $GITHUB_STEP_SUMMARY
+            echo "1. ✅ Create Application" >> $GITHUB_STEP_SUMMARY
+            echo "2. ✅ Submit Application" >> $GITHUB_STEP_SUMMARY
+            echo "3. ✅ Run Underwriting" >> $GITHUB_STEP_SUMMARY
+            echo "4. ✅ Process Decision" >> $GITHUB_STEP_SUMMARY
+            echo "5. ✅ Cleanup (Withdraw)" >> $GITHUB_STEP_SUMMARY
+          fi

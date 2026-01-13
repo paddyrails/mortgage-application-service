@@ -1,0 +1,243 @@
+name: Create ROSA Cluster with Spot Instances
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster name'
+        required: true
+        default: 'mortgage-test'
+      region:
+        description: 'AWS Region'
+        required: true
+        default: 'us-east-1'
+        type: choice
+        options:
+          - us-east-1
+          - us-east-2
+          - us-west-2
+          - eu-west-1
+      instance_type:
+        description: 'Worker instance type'
+        required: true
+        default: 'm5.xlarge'
+        type: choice
+        options:
+          - m5.large
+          - m5.xlarge
+          - m5.2xlarge
+          - t3.xlarge
+          - t3.2xlarge
+      worker_count:
+        description: 'Number of worker nodes'
+        required: true
+        default: '2'
+      use_spot:
+        description: 'Use Spot Instances for workers'
+        required: true
+        default: true
+        type: boolean
+      spot_max_price:
+        description: 'Max price for Spot (e.g., 0.10 for $0.10/hr, or on-demand to use on-demand price)'
+        required: false
+        default: 'on-demand'
+      openshift_version:
+        description: 'OpenShift version'
+        required: true
+        default: '4.14.12'
+
+env:
+  AWS_REGION: ${{ github.event.inputs.region }}
+
+jobs:
+  create-cluster:
+    name: Create ROSA Cluster
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install ROSA CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xvf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+          rosa version
+
+      - name: Install OpenShift CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz
+          tar -xvf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+          oc version --client
+
+      - name: Login to ROSA
+        run: |
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+          rosa whoami
+
+      - name: Verify AWS quotas and permissions
+        run: |
+          echo "🔍 Verifying AWS quotas..."
+          rosa verify quota --region=${{ env.AWS_REGION }}
+          
+          echo "🔍 Verifying AWS permissions..."
+          rosa verify permissions
+
+      - name: Check if cluster exists
+        id: check-cluster
+        run: |
+          if rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "⚠️ Cluster ${{ github.event.inputs.cluster_name }} already exists"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "✅ Cluster name is available"
+          fi
+
+      - name: Create ROSA Cluster
+        if: steps.check-cluster.outputs.exists == 'false'
+        run: |
+          echo "🚀 Creating ROSA cluster: ${{ github.event.inputs.cluster_name }}"
+          
+          # Create cluster with minimal default workers (we'll add spot pool after)
+          rosa create cluster \
+            --cluster-name=${{ github.event.inputs.cluster_name }} \
+            --region=${{ env.AWS_REGION }} \
+            --version=${{ github.event.inputs.openshift_version }} \
+            --compute-machine-type=${{ github.event.inputs.instance_type }} \
+            --replicas=2 \
+            --machine-cidr=10.0.0.0/16 \
+            --service-cidr=172.30.0.0/16 \
+            --pod-cidr=10.128.0.0/14 \
+            --host-prefix=23 \
+            --multi-az=false \
+            --yes
+          
+          echo "⏳ Cluster creation initiated. This takes ~40 minutes."
+
+      - name: Wait for cluster to be ready
+        if: steps.check-cluster.outputs.exists == 'false'
+        run: |
+          echo "⏳ Waiting for cluster to be ready..."
+          
+          # Poll every 2 minutes for up to 60 minutes
+          for i in {1..30}; do
+            STATUS=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.status.state')
+            echo "$(date): Cluster status: ${STATUS}"
+            
+            if [ "$STATUS" == "ready" ]; then
+              echo "✅ Cluster is ready!"
+              break
+            elif [ "$STATUS" == "error" ]; then
+              echo "❌ Cluster creation failed!"
+              rosa logs install --cluster=${{ github.event.inputs.cluster_name }} --tail=50
+              exit 1
+            fi
+            
+            sleep 120
+          done
+          
+          # Final check
+          STATUS=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.status.state')
+          if [ "$STATUS" != "ready" ]; then
+            echo "❌ Cluster not ready after 60 minutes"
+            exit 1
+          fi
+
+      - name: Create Spot Instance Machine Pool
+        if: github.event.inputs.use_spot == 'true'
+        run: |
+          echo "🎯 Creating Spot Instance machine pool..."
+          
+          # Build the command
+          SPOT_CMD="rosa create machinepool \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --name=spot-workers \
+            --instance-type=${{ github.event.inputs.instance_type }} \
+            --replicas=${{ github.event.inputs.worker_count }} \
+            --use-spot-instances"
+          
+          # Add max price if specified and not 'on-demand'
+          if [ "${{ github.event.inputs.spot_max_price }}" != "on-demand" ]; then
+            SPOT_CMD="${SPOT_CMD} --spot-max-price=${{ github.event.inputs.spot_max_price }}"
+          fi
+          
+          # Add labels
+          SPOT_CMD="${SPOT_CMD} --labels=node-type=spot,workload=mortgage-app"
+          
+          # Execute
+          eval $SPOT_CMD
+          
+          echo "✅ Spot machine pool created"
+
+      - name: Scale down default machine pool (if using spot)
+        if: github.event.inputs.use_spot == 'true'
+        run: |
+          echo "⬇️ Scaling down default (on-demand) machine pool..."
+          
+          # Scale default pool to 0 since we're using spot
+          rosa edit machinepool \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --replicas=0 \
+            worker \
+            || echo "Default pool may not exist or already scaled"
+          
+          echo "✅ Default machine pool scaled down"
+
+      - name: Create cluster admin user
+        run: |
+          echo "👤 Creating cluster admin user..."
+          
+          # Check if admin already exists
+          if rosa describe admin --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
+            echo "Admin user already exists"
+          else
+            rosa create admin --cluster=${{ github.event.inputs.cluster_name }}
+          fi
+
+      - name: Get cluster information
+        id: cluster-info
+        run: |
+          echo "📊 Cluster Information:"
+          echo ""
+          
+          # Get cluster details
+          rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }}
+          
+          # Get API URL
+          API_URL=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.api.url')
+          echo "api_url=${API_URL}" >> $GITHUB_OUTPUT
+          
+          # Get Console URL
+          CONSOLE_URL=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.console.url')
+          echo "console_url=${CONSOLE_URL}" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "🖥️ Machine Pools:"
+          rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
+
+      - name: Summary
+        run: |
+          echo "## 🎉 ROSA Cluster Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster Name | ${{ github.event.inputs.cluster_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | ${{ env.AWS_REGION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| OpenShift Version | ${{ github.event.inputs.openshift_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Instance Type | ${{ github.event.inputs.instance_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Worker Count | ${{ github.event.inputs.worker_count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Spot Instances | ${{ github.event.inputs.use_spot }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| API URL | ${{ steps.cluster-info.outputs.api_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Console URL | ${{ steps.cluster-info.outputs.console_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Get admin credentials: \`rosa describe admin --cluster=${{ github.event.inputs.cluster_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "2. Login: \`oc login <api-url> --username cluster-admin --password <password>\`" >> $GITHUB_STEP_SUMMARY
+          echo "3. Create namespace: \`oc new-project mortgage-app\`" >> $GITHUB_STEP_SUMMARY

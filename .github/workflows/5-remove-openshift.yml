@@ -1,0 +1,101 @@
+name: 5. Remove from OpenShift
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, prod]
+      confirm_delete:
+        description: 'Type "application-service" to confirm'
+        required: true
+
+env:
+  SERVICE_NAME: application-service
+  OPENSHIFT_NAMESPACE: mortgage-app
+
+jobs:
+  remove:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_delete }}" != "${{ env.SERVICE_NAME }}" ]; then
+            echo "❌ Confirmation failed!"
+            echo "Expected: ${{ env.SERVICE_NAME }}"
+            echo "Received: ${{ github.event.inputs.confirm_delete }}"
+            exit 1
+          fi
+          echo "✅ Deletion confirmed"
+
+      - uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: "4.14"
+
+      - uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ secrets.OPENSHIFT_SERVER }}
+          openshift_token: ${{ secrets.OPENSHIFT_TOKEN }}
+          insecure_skip_tls_verify: true
+          namespace: ${{ env.OPENSHIFT_NAMESPACE }}
+
+      - name: Pre-deletion status
+        run: |
+          echo "📋 Current resources:"
+          oc get deployment,service,route,configmap -l app=${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null || echo "No resources found"
+          echo ""
+          echo "Pods:"
+          oc get pods -l app=${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null || echo "No pods found"
+
+      - name: Scale down and delete
+        run: |
+          echo "⬇️ Scaling down..."
+          oc scale deployment/${{ env.SERVICE_NAME }} --replicas=0 -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null || true
+          
+          echo "⏳ Waiting for pods to terminate..."
+          sleep 10
+          
+          echo "🗑️ Deleting resources..."
+          oc delete route ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --ignore-not-found
+          oc delete service ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --ignore-not-found
+          oc delete deployment ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --ignore-not-found
+          oc delete configmap ${{ env.SERVICE_NAME }}-config -n ${{ env.OPENSHIFT_NAMESPACE }} --ignore-not-found
+          oc delete hpa ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --ignore-not-found 2>/dev/null || true
+          oc delete pdb ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} --ignore-not-found 2>/dev/null || true
+
+      - name: Verify deletion
+        run: |
+          echo "🔍 Verifying deletion..."
+          
+          FOUND=0
+          oc get deployment ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null && FOUND=1 || echo "✅ Deployment removed"
+          oc get service ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null && FOUND=1 || echo "✅ Service removed"
+          oc get route ${{ env.SERVICE_NAME }} -n ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null && FOUND=1 || echo "✅ Route removed"
+          
+          if [ "$FOUND" -eq 0 ]; then
+            echo ""
+            echo "🎉 All resources successfully removed!"
+          fi
+
+      - name: Summary
+        run: |
+          echo "## 🗑️ Application Service Removed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ env.SERVICE_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ github.event.inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | ${{ env.OPENSHIFT_NAMESPACE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Removed Resources" >> $GITHUB_STEP_SUMMARY
+          echo "- Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "- Service" >> $GITHUB_STEP_SUMMARY
+          echo "- Route" >> $GITHUB_STEP_SUMMARY
+          echo "- ConfigMap" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **Note**: Other services (customer, property, loans, payments) are still running." >> $GITHUB_STEP_SUMMARY

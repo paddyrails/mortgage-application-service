@@ -1,0 +1,163 @@
+name: Manage ROSA Machine Pools
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster name'
+        required: true
+        default: 'mortgage-test'
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - create-spot-pool
+          - scale-spot-pool
+          - delete-spot-pool
+          - list-pools
+          - enable-autoscaling
+      instance_type:
+        description: 'Instance type (for create)'
+        required: false
+        default: 'm5.xlarge'
+        type: choice
+        options:
+          - m5.large
+          - m5.xlarge
+          - m5.2xlarge
+          - m6i.xlarge
+          - c5.xlarge
+          - r5.xlarge
+      replicas:
+        description: 'Number of replicas (for create/scale)'
+        required: false
+        default: '2'
+      min_replicas:
+        description: 'Min replicas (for autoscaling)'
+        required: false
+        default: '1'
+      max_replicas:
+        description: 'Max replicas (for autoscaling)'
+        required: false
+        default: '4'
+      spot_max_price:
+        description: 'Max hourly price for Spot (e.g., 0.08, or on-demand)'
+        required: false
+        default: 'on-demand'
+      pool_name:
+        description: 'Machine pool name'
+        required: false
+        default: 'spot-workers'
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  manage-machinepool:
+    name: Manage Machine Pool
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install ROSA CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xvf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+          rosa version
+
+      - name: Login to ROSA
+        run: |
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+
+      - name: List Machine Pools
+        if: github.event.inputs.action == 'list-pools'
+        run: |
+          echo "📋 Current machine pools for ${{ github.event.inputs.cluster_name }}:"
+          rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
+
+      - name: Create Spot Machine Pool
+        if: github.event.inputs.action == 'create-spot-pool'
+        run: |
+          echo "🎯 Creating Spot Instance machine pool..."
+          
+          # Build command
+          CMD="rosa create machinepool \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --name=${{ github.event.inputs.pool_name }} \
+            --instance-type=${{ github.event.inputs.instance_type }} \
+            --replicas=${{ github.event.inputs.replicas }} \
+            --use-spot-instances"
+          
+          # Add spot max price if not on-demand
+          if [ "${{ github.event.inputs.spot_max_price }}" != "on-demand" ]; then
+            CMD="${CMD} --spot-max-price=${{ github.event.inputs.spot_max_price }}"
+          fi
+          
+          # Add labels and taints for workload isolation
+          CMD="${CMD} --labels=node-type=spot,workload=mortgage-app"
+          
+          echo "Executing: $CMD"
+          eval $CMD
+          
+          echo ""
+          echo "✅ Spot machine pool created!"
+          rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
+
+      - name: Scale Spot Machine Pool
+        if: github.event.inputs.action == 'scale-spot-pool'
+        run: |
+          echo "📏 Scaling machine pool ${{ github.event.inputs.pool_name }} to ${{ github.event.inputs.replicas }} replicas..."
+          
+          rosa edit machinepool \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --replicas=${{ github.event.inputs.replicas }} \
+            ${{ github.event.inputs.pool_name }}
+          
+          echo "✅ Machine pool scaled!"
+          rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
+
+      - name: Enable Autoscaling
+        if: github.event.inputs.action == 'enable-autoscaling'
+        run: |
+          echo "⚡ Enabling autoscaling for ${{ github.event.inputs.pool_name }}..."
+          
+          rosa edit machinepool \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --enable-autoscaling \
+            --min-replicas=${{ github.event.inputs.min_replicas }} \
+            --max-replicas=${{ github.event.inputs.max_replicas }} \
+            ${{ github.event.inputs.pool_name }}
+          
+          echo "✅ Autoscaling enabled!"
+          rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
+
+      - name: Delete Machine Pool
+        if: github.event.inputs.action == 'delete-spot-pool'
+        run: |
+          echo "🗑️ Deleting machine pool ${{ github.event.inputs.pool_name }}..."
+          
+          rosa delete machinepool \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            ${{ github.event.inputs.pool_name }} \
+            --yes
+          
+          echo "✅ Machine pool deleted!"
+          rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
+
+      - name: Summary
+        run: |
+          echo "## Machine Pool Operation Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster | ${{ github.event.inputs.cluster_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | ${{ github.event.inputs.action }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pool Name | ${{ github.event.inputs.pool_name }} |" >> $GITHUB_STEP_SUMMARY

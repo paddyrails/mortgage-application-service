@@ -1,0 +1,52 @@
+name: 1. Build and Push to ECR
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag'
+        required: false
+  push:
+    branches: [main]
+    paths: ['src/**', 'Dockerfile']
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: mortgage/application-service
+  SERVICE_NAME: application-service
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+      image_uri: ${{ steps.meta.outputs.uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet restore
+      - run: dotnet build --configuration Release --no-restore
+      - run: dotnet test --configuration Release --no-build
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - id: meta
+        run: |
+          TAG="${{ github.event.inputs.image_tag || github.sha }}"
+          TAG="${TAG::8}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "uri=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}" >> $GITHUB_OUTPUT
+      - run: |
+          docker build -t ${{ steps.meta.outputs.uri }} -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest .
+          docker push ${{ steps.meta.outputs.uri }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+      - run: |
+          echo "## 🐳 Application Service Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "URI: \`${{ steps.meta.outputs.uri }}\`" >> $GITHUB_STEP_SUMMARY
