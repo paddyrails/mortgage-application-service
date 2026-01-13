@@ -37,10 +37,6 @@ on:
         required: true
         default: true
         type: boolean
-      spot_max_price:
-        description: "Max price for Spot (e.g., 0.10 for $0.10/hr, or on-demand to use on-demand price)"
-        required: false
-        default: "on-demand"
       openshift_version:
         description: "OpenShift version"
         required: true
