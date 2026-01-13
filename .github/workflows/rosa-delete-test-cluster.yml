@@ -1,0 +1,215 @@
+name: Delete ROSA Test Cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster name to delete'
+        required: true
+        default: 'mortgage-test'
+      confirm_cluster_name:
+        description: 'Type cluster name again to confirm deletion'
+        required: true
+      delete_operator_roles:
+        description: 'Also delete operator roles'
+        required: true
+        default: true
+        type: boolean
+      delete_oidc_provider:
+        description: 'Also delete OIDC provider'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  delete-cluster:
+    name: Delete ROSA Cluster
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate confirmation
+        run: |
+          echo "🔐 Validating deletion confirmation..."
+          
+          if [ "${{ github.event.inputs.cluster_name }}" != "${{ github.event.inputs.confirm_cluster_name }}" ]; then
+            echo ""
+            echo "❌ CONFIRMATION FAILED!"
+            echo ""
+            echo "   Cluster name: ${{ github.event.inputs.cluster_name }}"
+            echo "   You entered:  ${{ github.event.inputs.confirm_cluster_name }}"
+            echo ""
+            echo "The names must match exactly to proceed with deletion."
+            exit 1
+          fi
+          
+          echo "✅ Deletion confirmed for cluster: ${{ github.event.inputs.cluster_name }}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install ROSA CLI
+        run: |
+          echo "📦 Installing ROSA CLI..."
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xvf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+          rosa version
+
+      - name: Login to ROSA
+        run: |
+          echo "🔐 Logging in to ROSA..."
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+          rosa whoami
+
+      - name: Verify cluster exists
+        id: verify
+        run: |
+          echo "🔍 Verifying cluster exists..."
+          
+          if rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo ""
+            echo "📋 Cluster details:"
+            rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }}
+            echo ""
+            echo "🖥️ Machine pools:"
+            rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }} || true
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo ""
+            echo "⚠️ Cluster '${{ github.event.inputs.cluster_name }}' not found!"
+            echo ""
+            echo "Available clusters:"
+            rosa list clusters
+            exit 1
+          fi
+
+      - name: Delete cluster
+        if: steps.verify.outputs.exists == 'true'
+        run: |
+          echo "🗑️ Deleting ROSA cluster: ${{ github.event.inputs.cluster_name }}"
+          echo ""
+          echo "⚠️ This action is IRREVERSIBLE!"
+          echo ""
+          
+          rosa delete cluster \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --yes
+          
+          echo ""
+          echo "✅ Cluster deletion initiated"
+
+      - name: Wait for cluster deletion
+        if: steps.verify.outputs.exists == 'true'
+        run: |
+          echo "⏳ Waiting for cluster deletion to complete..."
+          echo "   This typically takes 10-20 minutes."
+          echo ""
+          
+          TIMEOUT=1800  # 30 minutes
+          INTERVAL=60   # Check every minute
+          ELAPSED=0
+          
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            if ! rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
+              echo ""
+              echo "✅ Cluster deleted successfully!"
+              break
+            fi
+            
+            STATUS=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json 2>/dev/null | jq -r '.status.state' || echo "deleting")
+            echo "$(date '+%H:%M:%S') - Status: ${STATUS}"
+            
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+          
+          # Final check
+          if rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
+            echo ""
+            echo "⚠️ Cluster still exists after 30 minutes. It may still be deleting."
+            echo "   Check status with: rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }}"
+          fi
+
+      - name: Delete operator roles
+        if: github.event.inputs.delete_operator_roles == 'true'
+        run: |
+          echo "🧹 Cleaning up operator roles..."
+          
+          rosa delete operator-roles \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --mode=auto \
+            --yes 2>/dev/null || echo "Operator roles may already be deleted or not exist"
+          
+          echo "✅ Operator roles cleanup complete"
+
+      - name: Delete OIDC provider
+        if: github.event.inputs.delete_oidc_provider == 'true'
+        run: |
+          echo "🧹 Cleaning up OIDC provider..."
+          
+          rosa delete oidc-provider \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --mode=auto \
+            --yes 2>/dev/null || echo "OIDC provider may already be deleted or not exist"
+          
+          echo "✅ OIDC provider cleanup complete"
+
+      - name: Verify cleanup
+        run: |
+          echo "🔍 Verifying cleanup..."
+          echo ""
+          
+          # Check if cluster still exists
+          if rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
+            echo "⚠️ Cluster may still be deleting"
+            rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }}
+          else
+            echo "✅ Cluster successfully deleted"
+          fi
+          
+          echo ""
+          echo "📋 Remaining clusters:"
+          rosa list clusters || echo "No clusters found"
+
+      - name: Summary
+        run: |
+          echo "## 🗑️ ROSA Cluster Deletion Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster Name | \`${{ github.event.inputs.cluster_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | \`${{ env.AWS_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Operator Roles Deleted | ${{ github.event.inputs.delete_operator_roles }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| OIDC Provider Deleted | ${{ github.event.inputs.delete_oidc_provider }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Resources Cleaned Up" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ ROSA Cluster" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Worker Nodes (EC2 instances)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Machine Pools" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Load Balancers" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ EBS Volumes" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.delete_operator_roles }}" == "true" ]; then
+            echo "- ✅ IAM Operator Roles" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "${{ github.event.inputs.delete_oidc_provider }}" == "true" ]; then
+            echo "- ✅ OIDC Provider" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Cost Savings" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "By deleting this cluster, you are saving approximately:" >> $GITHUB_STEP_SUMMARY
+          echo "- **~\$570-805/month** (depending on Spot usage)" >> $GITHUB_STEP_SUMMARY
+          echo "- **~\$19-27/day**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### To Create a New Cluster" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Run the **Create ROSA Test Cluster** workflow when you need the environment again." >> $GITHUB_STEP_SUMMARY
