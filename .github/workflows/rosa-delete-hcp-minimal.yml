@@ -167,6 +167,7 @@ jobs:
         if: github.event.inputs.delete_vpc == 'true'
         run: |
           echo "🌐 Cleaning up VPC and networking resources..."
+          echo "   (VPC has 2 public + 2 private subnets in different AZs)"
           
           CLUSTER_NAME="${{ github.event.inputs.cluster_name }}"
           
@@ -183,10 +184,13 @@ jobs:
           
           echo "Found VPC: $VPC_ID"
           
+          # =====================
           # Delete NAT Gateways
-          echo "Deleting NAT Gateways..."
+          # =====================
+          echo ""
+          echo "🗑️ Deleting NAT Gateways..."
           NAT_GWS=$(aws ec2 describe-nat-gateways \
-            --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
+            --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending,deleting" \
             --query 'NatGateways[*].NatGatewayId' --output text 2>/dev/null || echo "")
           
           for NAT_GW in $NAT_GWS; do
@@ -194,54 +198,100 @@ jobs:
             aws ec2 delete-nat-gateway --nat-gateway-id $NAT_GW 2>/dev/null || true
           done
           
-          # Wait for NAT Gateways to delete
-          if [ -n "$NAT_GWS" ]; then
-            echo "  Waiting for NAT Gateways to delete..."
-            sleep 60
+          # Wait for NAT Gateways to fully delete
+          if [ -n "$NAT_GWS" ] && [ "$NAT_GWS" != "None" ]; then
+            echo "  ⏳ Waiting for NAT Gateways to delete (this may take 1-2 minutes)..."
+            for i in {1..24}; do
+              REMAINING=$(aws ec2 describe-nat-gateways \
+                --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending,deleting" \
+                --query 'NatGateways[*].NatGatewayId' --output text 2>/dev/null || echo "")
+              if [ -z "$REMAINING" ] || [ "$REMAINING" == "None" ]; then
+                echo "  ✅ NAT Gateways deleted"
+                break
+              fi
+              sleep 5
+            done
           fi
           
+          # =====================
           # Release Elastic IPs
-          echo "Releasing Elastic IPs..."
+          # =====================
+          echo ""
+          echo "🗑️ Releasing Elastic IPs..."
+          # Find EIPs by tag
           EIPS=$(aws ec2 describe-addresses \
+            --filters "Name=tag:Name,Values=${CLUSTER_NAME}*" \
+            --query 'Addresses[*].AllocationId' --output text 2>/dev/null || echo "")
+          
+          for EIP in $EIPS; do
+            if [ -n "$EIP" ] && [ "$EIP" != "None" ]; then
+              echo "  Releasing EIP: $EIP"
+              aws ec2 release-address --allocation-id $EIP 2>/dev/null || true
+            fi
+          done
+          
+          # Also release unassociated EIPs
+          UNASSOC_EIPS=$(aws ec2 describe-addresses \
             --filters "Name=domain,Values=vpc" \
             --query 'Addresses[?AssociationId==`null`].AllocationId' --output text 2>/dev/null || echo "")
           
-          for EIP in $EIPS; do
-            echo "  Releasing EIP: $EIP"
-            aws ec2 release-address --allocation-id $EIP 2>/dev/null || true
+          for EIP in $UNASSOC_EIPS; do
+            if [ -n "$EIP" ] && [ "$EIP" != "None" ]; then
+              echo "  Releasing unassociated EIP: $EIP"
+              aws ec2 release-address --allocation-id $EIP 2>/dev/null || true
+            fi
           done
           
-          # Delete subnets
-          echo "Deleting Subnets..."
+          # =====================
+          # Delete Subnets (all 4: 2 public + 2 private)
+          # =====================
+          echo ""
+          echo "🗑️ Deleting Subnets (4 total)..."
           SUBNETS=$(aws ec2 describe-subnets \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query 'Subnets[*].SubnetId' --output text 2>/dev/null || echo "")
           
           for SUBNET in $SUBNETS; do
-            echo "  Deleting Subnet: $SUBNET"
-            aws ec2 delete-subnet --subnet-id $SUBNET 2>/dev/null || true
+            if [ -n "$SUBNET" ] && [ "$SUBNET" != "None" ]; then
+              SUBNET_NAME=$(aws ec2 describe-subnets --subnet-ids $SUBNET \
+                --query 'Subnets[0].Tags[?Key==`Name`].Value' --output text 2>/dev/null || echo "unknown")
+              echo "  Deleting Subnet: $SUBNET ($SUBNET_NAME)"
+              aws ec2 delete-subnet --subnet-id $SUBNET 2>/dev/null || true
+            fi
           done
           
-          # Delete route tables (except main)
-          echo "Deleting Route Tables..."
+          # =====================
+          # Delete Route Tables
+          # =====================
+          echo ""
+          echo "🗑️ Deleting Route Tables..."
           RTBS=$(aws ec2 describe-route-tables \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text 2>/dev/null || echo "")
           
           for RTB in $RTBS; do
-            # Disassociate first
-            ASSOCS=$(aws ec2 describe-route-tables \
-              --route-table-ids $RTB \
-              --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text 2>/dev/null || echo "")
-            for ASSOC in $ASSOCS; do
-              aws ec2 disassociate-route-table --association-id $ASSOC 2>/dev/null || true
-            done
-            echo "  Deleting Route Table: $RTB"
-            aws ec2 delete-route-table --route-table-id $RTB 2>/dev/null || true
+            if [ -n "$RTB" ] && [ "$RTB" != "None" ]; then
+              # Disassociate all associations first
+              ASSOCS=$(aws ec2 describe-route-tables \
+                --route-table-ids $RTB \
+                --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text 2>/dev/null || echo "")
+              
+              for ASSOC in $ASSOCS; do
+                if [ -n "$ASSOC" ] && [ "$ASSOC" != "None" ]; then
+                  aws ec2 disassociate-route-table --association-id $ASSOC 2>/dev/null || true
+                fi
+              done
+              
+              echo "  Deleting Route Table: $RTB"
+              aws ec2 delete-route-table --route-table-id $RTB 2>/dev/null || true
+            fi
           done
           
-          # Detach and delete Internet Gateway
-          echo "Deleting Internet Gateway..."
+          # =====================
+          # Delete Internet Gateway
+          # =====================
+          echo ""
+          echo "🗑️ Deleting Internet Gateway..."
           IGW_ID=$(aws ec2 describe-internet-gateways \
             --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
             --query 'InternetGateways[0].InternetGatewayId' --output text 2>/dev/null || echo "None")
@@ -253,23 +303,31 @@ jobs:
             aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID 2>/dev/null || true
           fi
           
-          # Delete security groups (except default)
-          echo "Deleting Security Groups..."
+          # =====================
+          # Delete Security Groups
+          # =====================
+          echo ""
+          echo "🗑️ Deleting Security Groups..."
           SGS=$(aws ec2 describe-security-groups \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text 2>/dev/null || echo "")
           
           for SG in $SGS; do
-            echo "  Deleting Security Group: $SG"
-            aws ec2 delete-security-group --group-id $SG 2>/dev/null || true
+            if [ -n "$SG" ] && [ "$SG" != "None" ]; then
+              echo "  Deleting Security Group: $SG"
+              aws ec2 delete-security-group --group-id $SG 2>/dev/null || true
+            fi
           done
           
+          # =====================
           # Delete VPC
-          echo "Deleting VPC: $VPC_ID"
-          aws ec2 delete-vpc --vpc-id $VPC_ID 2>/dev/null || echo "VPC deletion may require manual cleanup"
+          # =====================
+          echo ""
+          echo "🗑️ Deleting VPC: $VPC_ID"
+          aws ec2 delete-vpc --vpc-id $VPC_ID 2>/dev/null || echo "⚠️ VPC deletion may require manual cleanup"
           
           echo ""
-          echo "✅ VPC cleanup complete"
+          echo "✅ VPC and networking cleanup complete"
 
       - name: Verify cleanup
         run: |
@@ -314,7 +372,7 @@ jobs:
           echo "| Resource | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| ROSA HCP Cluster | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
-          echo "| Worker Nodes | ✅ Terminated |" >> $GITHUB_STEP_SUMMARY
+          echo "| Worker Node | ✅ Terminated |" >> $GITHUB_STEP_SUMMARY
           echo "| Machine Pools | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
           if [ "${{ github.event.inputs.delete_oidc }}" == "true" ]; then
             echo "| OIDC Provider | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
@@ -322,7 +380,8 @@ jobs:
           fi
           if [ "${{ github.event.inputs.delete_vpc }}" == "true" ]; then
             echo "| VPC | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
-            echo "| Subnets | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Public Subnets (2) | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Private Subnets (2) | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
             echo "| NAT Gateway | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
             echo "| Internet Gateway | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
             echo "| Elastic IP | ✅ Released |" >> $GITHUB_STEP_SUMMARY
