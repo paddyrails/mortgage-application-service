@@ -4,23 +4,23 @@ on:
   workflow_dispatch:
     inputs:
       cluster_name:
-        description: 'Cluster name'
+        description: "Cluster name"
         required: true
-        default: 'mortgage-test'
+        default: "mortgage-test"
       use_spot:
-        description: 'Use Spot Instances for workers (saves ~70%)'
+        description: "Use Spot Instances for workers (saves ~70%)"
         required: true
         default: true
         type: boolean
       worker_count:
-        description: 'Number of worker nodes'
+        description: "Number of worker nodes"
         required: true
-        default: '2'
+        default: "1"
         type: choice
         options:
-          - '2'
-          - '3'
-          - '4'
+          - "2"
+          - "3"
+          - "4"
 
 env:
   AWS_REGION: us-east-1
@@ -32,7 +32,7 @@ jobs:
   create-cluster:
     name: Create ROSA Test Cluster
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -67,11 +67,11 @@ jobs:
         run: |
           echo "🔍 Verifying AWS quotas..."
           rosa verify quota --region=${{ env.AWS_REGION }}
-          
+
           echo ""
           echo "🔍 Verifying AWS permissions..."
           rosa verify permissions
-          
+
           echo ""
           echo "🔍 Available ROSA versions:"
           rosa list versions | grep -E "^4\.18" | head -5
@@ -97,10 +97,11 @@ jobs:
           echo "   Instance Type: ${{ env.INSTANCE_TYPE }}"
           echo "   Workers: ${{ github.event.inputs.worker_count }}"
           echo ""
-          
+
           # Create cluster with STS (recommended)
           rosa create cluster \
             --cluster-name=${{ github.event.inputs.cluster_name }} \
+            --hosted-cp \
             --region=${{ env.AWS_REGION }} \
             --version=${{ env.ROSA_VERSION }} \
             --compute-machine-type=${{ env.INSTANCE_TYPE }} \
@@ -113,7 +114,7 @@ jobs:
             --sts \
             --mode=auto \
             --yes
-          
+
           echo ""
           echo "⏳ Cluster creation initiated. This typically takes 30-45 minutes."
 
@@ -123,12 +124,12 @@ jobs:
           echo "⏳ Waiting for cluster to be ready..."
           echo "   This takes approximately 30-45 minutes."
           echo ""
-          
+
           # Wait for cluster to be ready (timeout 60 minutes)
           TIMEOUT=3600
           INTERVAL=120
           ELAPSED=0
-          
+
           while [ $ELAPSED -lt $TIMEOUT ]; do
             STATUS=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json 2>/dev/null | jq -r '.status.state' || echo "unknown")
             
@@ -148,7 +149,7 @@ jobs:
             sleep $INTERVAL
             ELAPSED=$((ELAPSED + INTERVAL))
           done
-          
+
           # Final status check
           FINAL_STATUS=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.status.state')
           if [ "$FINAL_STATUS" != "ready" ]; then
@@ -160,7 +161,7 @@ jobs:
         if: github.event.inputs.use_spot == 'true'
         run: |
           echo "🎯 Creating Spot Instance machine pool for cost savings..."
-          
+
           # Check if spot pool already exists
           if rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }} | grep -q "spot-workers"; then
             echo "Spot machine pool already exists"
@@ -180,23 +181,23 @@ jobs:
         if: github.event.inputs.use_spot == 'true'
         run: |
           echo "⬇️ Scaling down default (on-demand) machine pool to save costs..."
-          
+
           # Scale default worker pool to 0
           rosa edit machinepool \
             --cluster=${{ github.event.inputs.cluster_name }} \
             --replicas=0 \
             worker 2>/dev/null || echo "Default pool may not exist or already scaled"
-          
+
           echo "✅ Default pool scaled down. Workloads will run on Spot instances."
 
       - name: Create cluster admin
         id: admin
         run: |
           echo "👤 Creating cluster admin user..."
-          
+
           # Check if admin exists
           ADMIN_EXISTS=$(rosa describe admin --cluster=${{ github.event.inputs.cluster_name }} 2>&1 || echo "not found")
-          
+
           if echo "$ADMIN_EXISTS" | grep -q "not found\|does not exist"; then
             # Create new admin
             ADMIN_OUTPUT=$(rosa create admin --cluster=${{ github.event.inputs.cluster_name }})
@@ -216,17 +217,17 @@ jobs:
           echo "📊 Cluster Information"
           echo "======================"
           echo ""
-          
+
           rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }}
-          
+
           # Extract URLs
           API_URL=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.api.url')
           CONSOLE_URL=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.console.url')
-          
+
           echo ""
           echo "api_url=${API_URL}" >> $GITHUB_OUTPUT
           echo "console_url=${CONSOLE_URL}" >> $GITHUB_OUTPUT
-          
+
           echo ""
           echo "🖥️ Machine Pools:"
           rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
@@ -234,13 +235,13 @@ jobs:
       - name: Create mortgage-app namespace
         run: |
           echo "📁 Creating mortgage-app namespace..."
-          
+
           # Get cluster credentials
           API_URL=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.api.url')
-          
+
           # Login to cluster (using token from ROSA)
           oc login "$API_URL" --username=cluster-admin --password="${{ steps.admin.outputs.admin_password }}" --insecure-skip-tls-verify=true 2>/dev/null || echo "Will create namespace after manual login"
-          
+
           # Try to create namespace
           oc new-project ${{ env.OPENSHIFT_NAMESPACE }} 2>/dev/null || echo "Namespace may already exist or requires manual creation"
 
