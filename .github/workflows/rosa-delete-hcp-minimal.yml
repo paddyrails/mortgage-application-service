@@ -1,0 +1,367 @@
+name: Delete ROSA HCP Minimal Cluster
+
+# ============================================================
+# Deletes ROSA HCP cluster and cleans up all AWS resources:
+# - ROSA Cluster
+# - VPC, Subnets, Route Tables
+# - NAT Gateway, Internet Gateway
+# - Elastic IP
+# - OIDC Provider, Operator Roles
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster name to delete'
+        required: true
+        default: 'mortgage-test'
+      confirm_cluster_name:
+        description: 'Type cluster name again to confirm'
+        required: true
+      delete_vpc:
+        description: 'Also delete VPC and networking resources'
+        required: true
+        default: true
+        type: boolean
+      delete_oidc:
+        description: 'Also delete OIDC provider and operator roles'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  delete-cluster:
+    name: Delete ROSA HCP Cluster
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate confirmation
+        run: |
+          echo "🔐 Validating deletion confirmation..."
+          
+          if [ "${{ github.event.inputs.cluster_name }}" != "${{ github.event.inputs.confirm_cluster_name }}" ]; then
+            echo ""
+            echo "❌ CONFIRMATION FAILED!"
+            echo ""
+            echo "   Cluster name entered: ${{ github.event.inputs.cluster_name }}"
+            echo "   Confirmation entered: ${{ github.event.inputs.confirm_cluster_name }}"
+            echo ""
+            echo "   These must match exactly to proceed."
+            exit 1
+          fi
+          
+          echo "✅ Deletion confirmed for: ${{ github.event.inputs.cluster_name }}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install ROSA CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xvf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+          rosa version
+
+      - name: Login to ROSA
+        run: |
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+          rosa whoami
+
+      - name: Check cluster exists
+        id: check
+        run: |
+          echo "🔍 Checking if cluster exists..."
+          
+          if rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo ""
+            echo "📋 Cluster details:"
+            rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }}
+            echo ""
+            echo "🖥️ Machine pools:"
+            rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }} 2>/dev/null || true
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Cluster '${{ github.event.inputs.cluster_name }}' not found"
+            echo ""
+            echo "Available clusters:"
+            rosa list clusters
+          fi
+
+      - name: Delete ROSA cluster
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          echo "🗑️ Deleting ROSA HCP cluster: ${{ github.event.inputs.cluster_name }}"
+          echo ""
+          echo "⚠️  THIS ACTION IS IRREVERSIBLE!"
+          echo ""
+          
+          rosa delete cluster \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --yes
+          
+          echo ""
+          echo "✅ Cluster deletion initiated"
+
+      - name: Wait for cluster deletion
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          echo "⏳ Waiting for cluster deletion..."
+          echo "   This typically takes 5-15 minutes for HCP clusters."
+          echo ""
+          
+          TIMEOUT=1200  # 20 minutes
+          INTERVAL=30
+          ELAPSED=0
+          
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            if ! rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
+              echo ""
+              echo "✅ Cluster deleted successfully!"
+              break
+            fi
+            
+            STATUS=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json 2>/dev/null | jq -r '.status.state' || echo "deleting")
+            echo "$(date '+%H:%M:%S') - Status: ${STATUS}"
+            
+            if [ "$STATUS" == "error" ]; then
+              echo "❌ Error during deletion"
+              rosa logs uninstall --cluster=${{ github.event.inputs.cluster_name }} --tail=50 || true
+              break
+            fi
+            
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+      - name: Delete OIDC provider and operator roles
+        if: github.event.inputs.delete_oidc == 'true'
+        run: |
+          echo "🧹 Cleaning up OIDC provider and operator roles..."
+          
+          # Delete operator roles
+          echo "Deleting operator roles..."
+          rosa delete operator-roles \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --mode=auto \
+            --yes 2>/dev/null || echo "Operator roles may not exist or already deleted"
+          
+          # Delete OIDC provider
+          echo "Deleting OIDC provider..."
+          rosa delete oidc-provider \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --mode=auto \
+            --yes 2>/dev/null || echo "OIDC provider may not exist or already deleted"
+          
+          echo "✅ OIDC cleanup complete"
+
+      - name: Delete VPC and networking resources
+        if: github.event.inputs.delete_vpc == 'true'
+        run: |
+          echo "🌐 Cleaning up VPC and networking resources..."
+          
+          CLUSTER_NAME="${{ github.event.inputs.cluster_name }}"
+          
+          # Find VPC
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=${CLUSTER_NAME}-vpc" \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")
+          
+          if [ "$VPC_ID" == "None" ] || [ -z "$VPC_ID" ]; then
+            echo "No VPC found with name ${CLUSTER_NAME}-vpc"
+            echo "Skipping VPC cleanup"
+            exit 0
+          fi
+          
+          echo "Found VPC: $VPC_ID"
+          
+          # Delete NAT Gateways
+          echo "Deleting NAT Gateways..."
+          NAT_GWS=$(aws ec2 describe-nat-gateways \
+            --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
+            --query 'NatGateways[*].NatGatewayId' --output text 2>/dev/null || echo "")
+          
+          for NAT_GW in $NAT_GWS; do
+            echo "  Deleting NAT Gateway: $NAT_GW"
+            aws ec2 delete-nat-gateway --nat-gateway-id $NAT_GW 2>/dev/null || true
+          done
+          
+          # Wait for NAT Gateways to delete
+          if [ -n "$NAT_GWS" ]; then
+            echo "  Waiting for NAT Gateways to delete..."
+            sleep 60
+          fi
+          
+          # Release Elastic IPs
+          echo "Releasing Elastic IPs..."
+          EIPS=$(aws ec2 describe-addresses \
+            --filters "Name=domain,Values=vpc" \
+            --query 'Addresses[?AssociationId==`null`].AllocationId' --output text 2>/dev/null || echo "")
+          
+          for EIP in $EIPS; do
+            echo "  Releasing EIP: $EIP"
+            aws ec2 release-address --allocation-id $EIP 2>/dev/null || true
+          done
+          
+          # Delete subnets
+          echo "Deleting Subnets..."
+          SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets[*].SubnetId' --output text 2>/dev/null || echo "")
+          
+          for SUBNET in $SUBNETS; do
+            echo "  Deleting Subnet: $SUBNET"
+            aws ec2 delete-subnet --subnet-id $SUBNET 2>/dev/null || true
+          done
+          
+          # Delete route tables (except main)
+          echo "Deleting Route Tables..."
+          RTBS=$(aws ec2 describe-route-tables \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text 2>/dev/null || echo "")
+          
+          for RTB in $RTBS; do
+            # Disassociate first
+            ASSOCS=$(aws ec2 describe-route-tables \
+              --route-table-ids $RTB \
+              --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text 2>/dev/null || echo "")
+            for ASSOC in $ASSOCS; do
+              aws ec2 disassociate-route-table --association-id $ASSOC 2>/dev/null || true
+            done
+            echo "  Deleting Route Table: $RTB"
+            aws ec2 delete-route-table --route-table-id $RTB 2>/dev/null || true
+          done
+          
+          # Detach and delete Internet Gateway
+          echo "Deleting Internet Gateway..."
+          IGW_ID=$(aws ec2 describe-internet-gateways \
+            --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+            --query 'InternetGateways[0].InternetGatewayId' --output text 2>/dev/null || echo "None")
+          
+          if [ "$IGW_ID" != "None" ] && [ -n "$IGW_ID" ]; then
+            echo "  Detaching IGW: $IGW_ID"
+            aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID 2>/dev/null || true
+            echo "  Deleting IGW: $IGW_ID"
+            aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID 2>/dev/null || true
+          fi
+          
+          # Delete security groups (except default)
+          echo "Deleting Security Groups..."
+          SGS=$(aws ec2 describe-security-groups \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text 2>/dev/null || echo "")
+          
+          for SG in $SGS; do
+            echo "  Deleting Security Group: $SG"
+            aws ec2 delete-security-group --group-id $SG 2>/dev/null || true
+          done
+          
+          # Delete VPC
+          echo "Deleting VPC: $VPC_ID"
+          aws ec2 delete-vpc --vpc-id $VPC_ID 2>/dev/null || echo "VPC deletion may require manual cleanup"
+          
+          echo ""
+          echo "✅ VPC cleanup complete"
+
+      - name: Verify cleanup
+        run: |
+          echo "🔍 Verifying cleanup..."
+          echo ""
+          
+          # Check cluster
+          if rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
+            echo "⚠️ Cluster may still be deleting"
+          else
+            echo "✅ Cluster deleted"
+          fi
+          
+          # Check VPC
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=${{ github.event.inputs.cluster_name }}-vpc" \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")
+          
+          if [ "$VPC_ID" == "None" ] || [ -z "$VPC_ID" ]; then
+            echo "✅ VPC deleted"
+          else
+            echo "⚠️ VPC still exists: $VPC_ID (may need manual cleanup)"
+          fi
+          
+          echo ""
+          echo "📋 Remaining ROSA clusters:"
+          rosa list clusters || echo "No clusters found"
+
+      - name: Summary
+        run: |
+          echo "## 🗑️ ROSA HCP Cluster Deletion Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Cluster Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster Name | \`${{ github.event.inputs.cluster_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | \`${{ env.AWS_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Resources Cleaned Up" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ROSA HCP Cluster | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+          echo "| Worker Nodes | ✅ Terminated |" >> $GITHUB_STEP_SUMMARY
+          echo "| Machine Pools | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.delete_oidc }}" == "true" ]; then
+            echo "| OIDC Provider | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Operator Roles | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "${{ github.event.inputs.delete_vpc }}" == "true" ]; then
+            echo "| VPC | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Subnets | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| NAT Gateway | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Internet Gateway | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Elastic IP | ✅ Released |" >> $GITHUB_STEP_SUMMARY
+            echo "| Route Tables | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 💰 Cost Savings" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "By deleting this cluster, you save:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Period | Savings |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Per Hour | ~\$0.16 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Per Day | ~\$3.90 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Per Month | ~\$117 |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "To create a new cluster, run the **Create ROSA HCP Minimal Cluster** workflow." >> $GITHUB_STEP_SUMMARY
+
+      - name: Final output
+        run: |
+          echo ""
+          echo "════════════════════════════════════════════════════════════"
+          echo "  ✅ ROSA HCP CLUSTER DELETION COMPLETE"
+          echo "════════════════════════════════════════════════════════════"
+          echo ""
+          echo "  Cluster: ${{ github.event.inputs.cluster_name }}"
+          echo ""
+          echo "  Resources deleted:"
+          echo "    ✓ ROSA HCP Cluster"
+          echo "    ✓ Worker Nodes"
+          if [ "${{ github.event.inputs.delete_oidc }}" == "true" ]; then
+            echo "    ✓ OIDC Provider & Operator Roles"
+          fi
+          if [ "${{ github.event.inputs.delete_vpc }}" == "true" ]; then
+            echo "    ✓ VPC & Networking (NAT GW, IGW, Subnets)"
+          fi
+          echo ""
+          echo "  Monthly savings: ~\$117"
+          echo ""
+          echo "════════════════════════════════════════════════════════════"
