@@ -99,6 +99,9 @@ jobs:
           echo "   Workers: ${{ github.event.inputs.worker_count }}"
           echo ""
 
+          rosa create oidc-config -h
+          echo "   CREATEED OIDC CONFIG"
+
           # Create cluster with STS (recommended)
           rosa create cluster \
             --cluster-name=${{ github.event.inputs.cluster_name }} \
