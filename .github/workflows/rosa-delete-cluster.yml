@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       cluster_name:
-        description: 'Cluster name to delete'
+        description: "Cluster name to delete"
         required: true
       confirm_delete:
-        description: 'Type cluster name again to confirm deletion'
+        description: "Type cluster name again to confirm deletion"
         required: true
 
 env:
@@ -58,7 +58,7 @@ jobs:
         run: |
           echo "🗑️ Deleting cluster ${{ github.event.inputs.cluster_name }}..."
           rosa delete cluster --cluster=${{ github.event.inputs.cluster_name }} --yes
-          
+
           echo "⏳ Waiting for cluster deletion to complete..."
           # Poll for deletion (up to 30 minutes)
           for i in {1..30}; do
