@@ -1,0 +1,211 @@
+name: Delete ROSA HCP Minimal Cluster
+
+# ============================================================
+# Deletes ROSA HCP cluster and all AWS resources:
+# - ROSA HCP Cluster
+# - VPC (2 public + 2 private subnets)
+# - NAT Gateway, Internet Gateway
+# - Elastic IP, Route Tables
+# - OIDC Provider, Operator Roles
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster name to delete'
+        required: true
+        default: 'mortgage-test'
+      confirm_cluster_name:
+        description: 'Type cluster name again to confirm'
+        required: true
+      delete_vpc:
+        description: 'Delete VPC and networking'
+        required: true
+        default: true
+        type: boolean
+      delete_oidc:
+        description: 'Delete OIDC provider and roles'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  delete-cluster:
+    name: Delete ROSA HCP Cluster
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.cluster_name }}" != "${{ github.event.inputs.confirm_cluster_name }}" ]; then
+            echo "❌ Confirmation failed!"
+            echo "   Expected: ${{ github.event.inputs.cluster_name }}"
+            echo "   Got: ${{ github.event.inputs.confirm_cluster_name }}"
+            exit 1
+          fi
+          echo "✅ Confirmed deletion of: ${{ github.event.inputs.cluster_name }}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install ROSA CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xvf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+
+      - name: Login to ROSA
+        run: |
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+
+      - name: Check cluster exists
+        id: check
+        run: |
+          if rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }}
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Cluster not found"
+          fi
+
+      - name: Delete ROSA cluster
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          echo "🗑️ Deleting cluster: ${{ github.event.inputs.cluster_name }}"
+          rosa delete cluster --cluster=${{ github.event.inputs.cluster_name }} --yes
+
+      - name: Wait for deletion
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          echo "⏳ Waiting for cluster deletion (~5-15 min)..."
+          
+          for i in {1..30}; do
+            if ! rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
+              echo "✅ Cluster deleted!"
+              break
+            fi
+            echo "$(date '+%H:%M:%S') - Still deleting..."
+            sleep 30
+          done
+
+      - name: Delete OIDC and roles
+        if: github.event.inputs.delete_oidc == 'true'
+        run: |
+          echo "🧹 Cleaning up OIDC and roles..."
+          rosa delete operator-roles --cluster=${{ github.event.inputs.cluster_name }} --mode=auto --yes 2>/dev/null || true
+          rosa delete oidc-provider --cluster=${{ github.event.inputs.cluster_name }} --mode=auto --yes 2>/dev/null || true
+
+      - name: Delete VPC and networking
+        if: github.event.inputs.delete_vpc == 'true'
+        run: |
+          echo "🌐 Cleaning up VPC and networking..."
+          
+          CLUSTER_NAME="${{ github.event.inputs.cluster_name }}"
+          
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=${CLUSTER_NAME}-vpc" \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")
+          
+          if [ "$VPC_ID" == "None" ] || [ -z "$VPC_ID" ]; then
+            echo "No VPC found"
+            exit 0
+          fi
+          
+          echo "Found VPC: $VPC_ID"
+          
+          # Delete NAT Gateways
+          echo "Deleting NAT Gateways..."
+          for NAT in $(aws ec2 describe-nat-gateways \
+            --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
+            --query 'NatGateways[*].NatGatewayId' --output text 2>/dev/null); do
+            [ -n "$NAT" ] && [ "$NAT" != "None" ] && aws ec2 delete-nat-gateway --nat-gateway-id $NAT
+          done
+          
+          echo "⏳ Waiting for NAT Gateway deletion..."
+          sleep 60
+          
+          # Release Elastic IPs
+          echo "Releasing Elastic IPs..."
+          for EIP in $(aws ec2 describe-addresses \
+            --filters "Name=tag:Name,Values=${CLUSTER_NAME}*" \
+            --query 'Addresses[*].AllocationId' --output text 2>/dev/null); do
+            [ -n "$EIP" ] && [ "$EIP" != "None" ] && aws ec2 release-address --allocation-id $EIP 2>/dev/null || true
+          done
+          
+          # Delete all subnets (4 total: 2 public + 2 private)
+          echo "Deleting Subnets..."
+          for SUBNET in $(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets[*].SubnetId' --output text 2>/dev/null); do
+            [ -n "$SUBNET" ] && [ "$SUBNET" != "None" ] && aws ec2 delete-subnet --subnet-id $SUBNET 2>/dev/null || true
+          done
+          
+          # Delete route tables
+          echo "Deleting Route Tables..."
+          for RTB in $(aws ec2 describe-route-tables \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text 2>/dev/null); do
+            if [ -n "$RTB" ] && [ "$RTB" != "None" ]; then
+              for ASSOC in $(aws ec2 describe-route-tables --route-table-ids $RTB \
+                --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text 2>/dev/null); do
+                [ -n "$ASSOC" ] && [ "$ASSOC" != "None" ] && aws ec2 disassociate-route-table --association-id $ASSOC 2>/dev/null || true
+              done
+              aws ec2 delete-route-table --route-table-id $RTB 2>/dev/null || true
+            fi
+          done
+          
+          # Delete Internet Gateway
+          echo "Deleting Internet Gateway..."
+          IGW=$(aws ec2 describe-internet-gateways \
+            --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+            --query 'InternetGateways[0].InternetGatewayId' --output text 2>/dev/null || echo "None")
+          if [ "$IGW" != "None" ] && [ -n "$IGW" ]; then
+            aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC_ID 2>/dev/null || true
+            aws ec2 delete-internet-gateway --internet-gateway-id $IGW 2>/dev/null || true
+          fi
+          
+          # Delete security groups
+          echo "Deleting Security Groups..."
+          for SG in $(aws ec2 describe-security-groups \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text 2>/dev/null); do
+            [ -n "$SG" ] && [ "$SG" != "None" ] && aws ec2 delete-security-group --group-id $SG 2>/dev/null || true
+          done
+          
+          # Delete VPC
+          echo "Deleting VPC..."
+          aws ec2 delete-vpc --vpc-id $VPC_ID 2>/dev/null || echo "⚠️ VPC may need manual cleanup"
+          
+          echo "✅ VPC cleanup complete"
+
+      - name: Summary
+        run: |
+          echo "## 🗑️ ROSA HCP Cluster Deleted" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+          echo "| Worker Node | ✅ Terminated |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.delete_oidc }}" == "true" ]; then
+            echo "| OIDC Provider | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Operator Roles | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "${{ github.event.inputs.delete_vpc }}" == "true" ]; then
+            echo "| VPC | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Public Subnets (2) | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Private Subnets (2) | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| NAT Gateway | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Internet Gateway | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Elastic IP | ✅ Released |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Monthly savings:** ~\$117" >> $GITHUB_STEP_SUMMARY

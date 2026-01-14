@@ -1,0 +1,383 @@
+name: Create ROSA HCP Minimal Cluster (1 Worker)
+
+# ============================================================
+# ROSA with Hosted Control Plane (HCP) - Minimal Configuration
+# 
+# This is the CHEAPEST OpenShift cluster on AWS:
+# - Hosted Control Plane: ~$30/month (vs $500 for classic)
+# - 1 Worker Node (Spot): ~$45/month
+# - Total: ~$117/month
+#
+# ROSA HCP public cluster requires:
+# - At least 1 public subnet (for load balancers)
+# - At least 2 private subnets in different AZs (for workers)
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster name'
+        required: true
+        default: 'mortgage-test'
+      instance_type:
+        description: 'Worker instance type'
+        required: true
+        default: 'm5.xlarge'
+        type: choice
+        options:
+          - 'm5.large'
+          - 'm5.xlarge'
+          - 'm5.2xlarge'
+      use_spot:
+        description: 'Use Spot Instance (saves ~70%)'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+  ROSA_VERSION: "4.18.30"
+  WORKER_COUNT: 1
+
+jobs:
+  create-minimal-cluster:
+    name: Create ROSA HCP Minimal Cluster
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install ROSA CLI
+        run: |
+          echo "📦 Installing ROSA CLI..."
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xvf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+          rosa version
+
+      - name: Install OpenShift CLI
+        run: |
+          echo "📦 Installing OpenShift CLI..."
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xvf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+          oc version --client
+
+      - name: Login to ROSA
+        run: |
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+          rosa whoami
+
+      - name: Verify prerequisites
+        run: |
+          echo "🔍 Verifying prerequisites..."
+          rosa verify quota --region=${{ env.AWS_REGION }}
+          rosa verify permissions
+          
+          echo ""
+          echo "📋 Available HCP versions:"
+          rosa list versions --hosted-cp 2>/dev/null | grep -E "^4\.18" | head -5 || rosa list versions --hosted-cp | head -10
+
+      - name: Setup VPC with Public and Private Subnets
+        id: network
+        run: |
+          echo "🌐 Setting up networking for ROSA HCP..."
+          echo ""
+          echo "Required for public HCP cluster:"
+          echo "  - 1+ public subnets (for ingress/load balancers)"
+          echo "  - 2+ private subnets in different AZs (for workers)"
+          echo ""
+          
+          CLUSTER_NAME="${{ github.event.inputs.cluster_name }}"
+          VPC_CIDR="10.0.0.0/16"
+          
+          AZ1="${{ env.AWS_REGION }}a"
+          AZ2="${{ env.AWS_REGION }}b"
+          
+          PUBLIC_SUBNET_1_CIDR="10.0.1.0/24"
+          PUBLIC_SUBNET_2_CIDR="10.0.2.0/24"
+          PRIVATE_SUBNET_1_CIDR="10.0.128.0/24"
+          PRIVATE_SUBNET_2_CIDR="10.0.129.0/24"
+          
+          # Check for existing VPC
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=${CLUSTER_NAME}-vpc" \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null)
+          
+          if [ "$VPC_ID" == "None" ] || [ -z "$VPC_ID" ]; then
+            echo "Creating new VPC..."
+            
+            # Create VPC
+            VPC_ID=$(aws ec2 create-vpc \
+              --cidr-block $VPC_CIDR \
+              --query 'Vpc.VpcId' --output text)
+            
+            aws ec2 create-tags --resources $VPC_ID \
+              --tags Key=Name,Value=${CLUSTER_NAME}-vpc
+            
+            aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames '{"Value":true}'
+            aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support '{"Value":true}'
+            
+            echo "✅ VPC: $VPC_ID"
+            
+            # Create Internet Gateway
+            IGW_ID=$(aws ec2 create-internet-gateway \
+              --query 'InternetGateway.InternetGatewayId' --output text)
+            aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $IGW_ID
+            aws ec2 create-tags --resources $IGW_ID \
+              --tags Key=Name,Value=${CLUSTER_NAME}-igw
+            
+            echo "✅ Internet Gateway: $IGW_ID"
+            
+            # Create Public Subnets
+            PUBLIC_SUBNET_1=$(aws ec2 create-subnet \
+              --vpc-id $VPC_ID \
+              --cidr-block $PUBLIC_SUBNET_1_CIDR \
+              --availability-zone $AZ1 \
+              --query 'Subnet.SubnetId' --output text)
+            aws ec2 create-tags --resources $PUBLIC_SUBNET_1 \
+              --tags Key=Name,Value=${CLUSTER_NAME}-public-${AZ1}
+            aws ec2 modify-subnet-attribute --subnet-id $PUBLIC_SUBNET_1 --map-public-ip-on-launch
+            
+            PUBLIC_SUBNET_2=$(aws ec2 create-subnet \
+              --vpc-id $VPC_ID \
+              --cidr-block $PUBLIC_SUBNET_2_CIDR \
+              --availability-zone $AZ2 \
+              --query 'Subnet.SubnetId' --output text)
+            aws ec2 create-tags --resources $PUBLIC_SUBNET_2 \
+              --tags Key=Name,Value=${CLUSTER_NAME}-public-${AZ2}
+            aws ec2 modify-subnet-attribute --subnet-id $PUBLIC_SUBNET_2 --map-public-ip-on-launch
+            
+            echo "✅ Public Subnets: $PUBLIC_SUBNET_1, $PUBLIC_SUBNET_2"
+            
+            # Create Private Subnets
+            PRIVATE_SUBNET_1=$(aws ec2 create-subnet \
+              --vpc-id $VPC_ID \
+              --cidr-block $PRIVATE_SUBNET_1_CIDR \
+              --availability-zone $AZ1 \
+              --query 'Subnet.SubnetId' --output text)
+            aws ec2 create-tags --resources $PRIVATE_SUBNET_1 \
+              --tags Key=Name,Value=${CLUSTER_NAME}-private-${AZ1}
+            
+            PRIVATE_SUBNET_2=$(aws ec2 create-subnet \
+              --vpc-id $VPC_ID \
+              --cidr-block $PRIVATE_SUBNET_2_CIDR \
+              --availability-zone $AZ2 \
+              --query 'Subnet.SubnetId' --output text)
+            aws ec2 create-tags --resources $PRIVATE_SUBNET_2 \
+              --tags Key=Name,Value=${CLUSTER_NAME}-private-${AZ2}
+            
+            echo "✅ Private Subnets: $PRIVATE_SUBNET_1, $PRIVATE_SUBNET_2"
+            
+            # Create Elastic IP
+            EIP_ALLOC=$(aws ec2 allocate-address \
+              --domain vpc \
+              --query 'AllocationId' --output text)
+            aws ec2 create-tags --resources $EIP_ALLOC \
+              --tags Key=Name,Value=${CLUSTER_NAME}-eip
+            
+            echo "✅ Elastic IP: $EIP_ALLOC"
+            
+            # Create NAT Gateway
+            NAT_GW_ID=$(aws ec2 create-nat-gateway \
+              --subnet-id $PUBLIC_SUBNET_1 \
+              --allocation-id $EIP_ALLOC \
+              --query 'NatGateway.NatGatewayId' --output text)
+            aws ec2 create-tags --resources $NAT_GW_ID \
+              --tags Key=Name,Value=${CLUSTER_NAME}-nat
+            
+            echo "⏳ Waiting for NAT Gateway..."
+            aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT_GW_ID
+            echo "✅ NAT Gateway: $NAT_GW_ID"
+            
+            # Public Route Table
+            PUBLIC_RTB=$(aws ec2 create-route-table \
+              --vpc-id $VPC_ID \
+              --query 'RouteTable.RouteTableId' --output text)
+            aws ec2 create-tags --resources $PUBLIC_RTB \
+              --tags Key=Name,Value=${CLUSTER_NAME}-public-rtb
+            aws ec2 create-route --route-table-id $PUBLIC_RTB \
+              --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+            aws ec2 associate-route-table --subnet-id $PUBLIC_SUBNET_1 --route-table-id $PUBLIC_RTB
+            aws ec2 associate-route-table --subnet-id $PUBLIC_SUBNET_2 --route-table-id $PUBLIC_RTB
+            
+            echo "✅ Public Route Table: $PUBLIC_RTB"
+            
+            # Private Route Table
+            PRIVATE_RTB=$(aws ec2 create-route-table \
+              --vpc-id $VPC_ID \
+              --query 'RouteTable.RouteTableId' --output text)
+            aws ec2 create-tags --resources $PRIVATE_RTB \
+              --tags Key=Name,Value=${CLUSTER_NAME}-private-rtb
+            aws ec2 create-route --route-table-id $PRIVATE_RTB \
+              --destination-cidr-block 0.0.0.0/0 --nat-gateway-id $NAT_GW_ID
+            aws ec2 associate-route-table --subnet-id $PRIVATE_SUBNET_1 --route-table-id $PRIVATE_RTB
+            aws ec2 associate-route-table --subnet-id $PRIVATE_SUBNET_2 --route-table-id $PRIVATE_RTB
+            
+            echo "✅ Private Route Table: $PRIVATE_RTB"
+            
+          else
+            echo "Using existing VPC: $VPC_ID"
+            PUBLIC_SUBNET_1=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=*public*a*" \
+              --query 'Subnets[0].SubnetId' --output text)
+            PUBLIC_SUBNET_2=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=*public*b*" \
+              --query 'Subnets[0].SubnetId' --output text)
+            PRIVATE_SUBNET_1=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=*private*a*" \
+              --query 'Subnets[0].SubnetId' --output text)
+            PRIVATE_SUBNET_2=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=*private*b*" \
+              --query 'Subnets[0].SubnetId' --output text)
+          fi
+          
+          # ROSA HCP needs all subnets: public1,public2,private1,private2
+          ALL_SUBNETS="${PUBLIC_SUBNET_1},${PUBLIC_SUBNET_2},${PRIVATE_SUBNET_1},${PRIVATE_SUBNET_2}"
+          
+          echo "vpc_id=$VPC_ID" >> $GITHUB_OUTPUT
+          echo "all_subnets=$ALL_SUBNETS" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "════════════════════════════════════════════════════"
+          echo "📊 Network Summary"
+          echo "════════════════════════════════════════════════════"
+          echo "VPC:              $VPC_ID"
+          echo "Public Subnet 1:  $PUBLIC_SUBNET_1"
+          echo "Public Subnet 2:  $PUBLIC_SUBNET_2"
+          echo "Private Subnet 1: $PRIVATE_SUBNET_1"
+          echo "Private Subnet 2: $PRIVATE_SUBNET_2"
+          echo ""
+          echo "Subnet IDs for ROSA: $ALL_SUBNETS"
+          echo "════════════════════════════════════════════════════"
+
+      - name: Create or get OIDC config
+        id: oidc
+        run: |
+          echo "🔐 Setting up OIDC configuration..."
+          
+          OIDC_ID=$(rosa list oidc-config -o json 2>/dev/null | jq -r '.[0].id // empty')
+          
+          if [ -z "$OIDC_ID" ]; then
+            rosa create oidc-config --mode=auto --yes
+            sleep 5
+            OIDC_ID=$(rosa list oidc-config -o json | jq -r '.[0].id')
+          fi
+          
+          echo "oidc_id=$OIDC_ID" >> $GITHUB_OUTPUT
+          echo "✅ OIDC Config: $OIDC_ID"
+
+      - name: Check if cluster exists
+        id: check
+        run: |
+          if rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} &>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "⚠️ Cluster already exists!"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "✅ Cluster name available"
+          fi
+
+      - name: Create ROSA HCP Cluster
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          echo "🚀 Creating ROSA HCP cluster..."
+          echo ""
+          echo "┌───────────────────────────────────────────────┐"
+          echo "│  CONFIGURATION                                │"
+          echo "├───────────────────────────────────────────────┤"
+          echo "│  Control Plane:   Hosted (shared)             │"
+          echo "│  Workers:         1x ${{ github.event.inputs.instance_type }}               │"
+          echo "│  Spot:            ${{ github.event.inputs.use_spot }}                       │"
+          echo "│  Version:         ${{ env.ROSA_VERSION }}                  │"
+          echo "│  Region:          ${{ env.AWS_REGION }}                   │"
+          echo "│  Subnets:         2 public + 2 private        │"
+          echo "└───────────────────────────────────────────────┘"
+          echo ""
+          
+          rosa create cluster \
+            --cluster-name=${{ github.event.inputs.cluster_name }} \
+            --hosted-cp \
+            --region=${{ env.AWS_REGION }} \
+            --version=${{ env.ROSA_VERSION }} \
+            --compute-machine-type=${{ github.event.inputs.instance_type }} \
+            --replicas=${{ env.WORKER_COUNT }} \
+            --subnet-ids=${{ steps.network.outputs.all_subnets }} \
+            --oidc-config-id=${{ steps.oidc.outputs.oidc_id }} \
+            --sts \
+            --mode=auto \
+            --yes
+          
+          echo ""
+          echo "⏳ Cluster creation started (~15-20 min)"
+
+      - name: Wait for cluster
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          echo "⏳ Waiting for cluster..."
+          
+          for i in {1..40}; do
+            STATUS=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json 2>/dev/null | jq -r '.status.state' || echo "pending")
+            echo "$(date '+%H:%M:%S') - $STATUS"
+            
+            [ "$STATUS" == "ready" ] && echo "✅ Ready!" && break
+            [ "$STATUS" == "error" ] && echo "❌ Failed!" && rosa logs install --cluster=${{ github.event.inputs.cluster_name }} --tail=50 && exit 1
+            
+            sleep 60
+          done
+
+      - name: Configure Spot Instance
+        if: github.event.inputs.use_spot == 'true'
+        run: |
+          echo "🎯 Setting up Spot instance..."
+          
+          rosa create machinepool \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --name=spot-worker \
+            --instance-type=${{ github.event.inputs.instance_type }} \
+            --replicas=1 \
+            --use-spot-instances \
+            --labels=node-type=spot 2>/dev/null || true
+          
+          rosa edit machinepool \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --replicas=0 workers 2>/dev/null || true
+          
+          echo "✅ Spot configured"
+
+      - name: Create admin
+        run: |
+          rosa create admin --cluster=${{ github.event.inputs.cluster_name }} 2>/dev/null || true
+          echo "Get credentials: rosa describe admin --cluster=${{ github.event.inputs.cluster_name }}"
+
+      - name: Get cluster info
+        id: info
+        run: |
+          API_URL=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.api.url')
+          CONSOLE_URL=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.console.url')
+          
+          echo "api_url=${API_URL}" >> $GITHUB_OUTPUT
+          echo "console_url=${CONSOLE_URL}" >> $GITHUB_OUTPUT
+          
+          rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }}
+          rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
+
+      - name: Summary
+        run: |
+          echo "## 🎉 ROSA HCP Cluster Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster | \`${{ github.event.inputs.cluster_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | \`${{ env.ROSA_VERSION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Workers | 1x ${{ github.event.inputs.instance_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Spot | ${{ github.event.inputs.use_spot }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Console | ${{ steps.info.outputs.console_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Cost:** ~\$117/month" >> $GITHUB_STEP_SUMMARY
