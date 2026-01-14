@@ -2,7 +2,7 @@ name: Create ROSA HCP Minimal Cluster (1 Worker)
 
 # ============================================================
 # ROSA with Hosted Control Plane (HCP) - Minimal Configuration
-# 
+#
 # This is the CHEAPEST OpenShift cluster on AWS:
 # - Hosted Control Plane: ~$30/month (vs $500 for classic)
 # - 1 Worker Node (Spot): ~$45/month
@@ -17,20 +17,20 @@ on:
   workflow_dispatch:
     inputs:
       cluster_name:
-        description: 'Cluster name'
+        description: "Cluster name"
         required: true
-        default: 'mortgage-test'
+        default: "mortgage-test"
       instance_type:
-        description: 'Worker instance type'
+        description: "Worker instance type"
         required: true
-        default: 'm5.xlarge'
+        default: "m5.xlarge"
         type: choice
         options:
-          - 'm5.large'
-          - 'm5.xlarge'
-          - 'm5.2xlarge'
+          - "m5.large"
+          - "m5.xlarge"
+          - "m5.2xlarge"
       use_spot:
-        description: 'Use Spot Instance (saves ~70%)'
+        description: "Use Spot Instance (saves ~70%)"
         required: true
         default: true
         type: boolean
@@ -38,13 +38,13 @@ on:
 env:
   AWS_REGION: us-east-1
   ROSA_VERSION: "4.18.30"
-  WORKER_COUNT: 1
+  WORKER_COUNT: 2
 
 jobs:
   create-minimal-cluster:
     name: Create ROSA HCP Minimal Cluster
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -79,7 +79,7 @@ jobs:
           echo "🔍 Verifying prerequisites..."
           rosa verify quota --region=${{ env.AWS_REGION }}
           rosa verify permissions
-          
+
           echo ""
           echo "📋 Available HCP versions:"
           rosa list versions --hosted-cp 2>/dev/null | grep -E "^4\.18" | head -5 || rosa list versions --hosted-cp | head -10
@@ -93,23 +93,23 @@ jobs:
           echo "  - 1+ public subnets (for ingress/load balancers)"
           echo "  - 2+ private subnets in different AZs (for workers)"
           echo ""
-          
+
           CLUSTER_NAME="${{ github.event.inputs.cluster_name }}"
           VPC_CIDR="10.0.0.0/16"
-          
+
           AZ1="${{ env.AWS_REGION }}a"
           AZ2="${{ env.AWS_REGION }}b"
-          
+
           PUBLIC_SUBNET_1_CIDR="10.0.1.0/24"
           PUBLIC_SUBNET_2_CIDR="10.0.2.0/24"
           PRIVATE_SUBNET_1_CIDR="10.0.128.0/24"
           PRIVATE_SUBNET_2_CIDR="10.0.129.0/24"
-          
+
           # Check for existing VPC
           VPC_ID=$(aws ec2 describe-vpcs \
             --filters "Name=tag:Name,Values=${CLUSTER_NAME}-vpc" \
             --query 'Vpcs[0].VpcId' --output text 2>/dev/null)
-          
+
           if [ "$VPC_ID" == "None" ] || [ -z "$VPC_ID" ]; then
             echo "Creating new VPC..."
             
@@ -237,13 +237,13 @@ jobs:
               --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=*private*b*" \
               --query 'Subnets[0].SubnetId' --output text)
           fi
-          
+
           # ROSA HCP needs all subnets: public1,public2,private1,private2
           ALL_SUBNETS="${PUBLIC_SUBNET_1},${PUBLIC_SUBNET_2},${PRIVATE_SUBNET_1},${PRIVATE_SUBNET_2}"
-          
+
           echo "vpc_id=$VPC_ID" >> $GITHUB_OUTPUT
           echo "all_subnets=$ALL_SUBNETS" >> $GITHUB_OUTPUT
-          
+
           echo ""
           echo "════════════════════════════════════════════════════"
           echo "📊 Network Summary"
@@ -261,15 +261,15 @@ jobs:
         id: oidc
         run: |
           echo "🔐 Setting up OIDC configuration..."
-          
+
           OIDC_ID=$(rosa list oidc-config -o json 2>/dev/null | jq -r '.[0].id // empty')
-          
+
           if [ -z "$OIDC_ID" ]; then
             rosa create oidc-config --mode=auto --yes
             sleep 5
             OIDC_ID=$(rosa list oidc-config -o json | jq -r '.[0].id')
           fi
-          
+
           echo "oidc_id=$OIDC_ID" >> $GITHUB_OUTPUT
           echo "✅ OIDC Config: $OIDC_ID"
 
@@ -300,7 +300,7 @@ jobs:
           echo "│  Subnets:         2 public + 2 private        │"
           echo "└───────────────────────────────────────────────┘"
           echo ""
-          
+
           rosa create cluster \
             --cluster-name=${{ github.event.inputs.cluster_name }} \
             --hosted-cp \
@@ -313,7 +313,7 @@ jobs:
             --sts \
             --mode=auto \
             --yes
-          
+
           echo ""
           echo "⏳ Cluster creation started (~15-20 min)"
 
@@ -321,7 +321,7 @@ jobs:
         if: steps.check.outputs.exists == 'false'
         run: |
           echo "⏳ Waiting for cluster..."
-          
+
           for i in {1..40}; do
             STATUS=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json 2>/dev/null | jq -r '.status.state' || echo "pending")
             echo "$(date '+%H:%M:%S') - $STATUS"
@@ -336,7 +336,7 @@ jobs:
         if: github.event.inputs.use_spot == 'true'
         run: |
           echo "🎯 Setting up Spot instance..."
-          
+
           rosa create machinepool \
             --cluster=${{ github.event.inputs.cluster_name }} \
             --name=spot-worker \
@@ -344,11 +344,11 @@ jobs:
             --replicas=1 \
             --use-spot-instances \
             --labels=node-type=spot 2>/dev/null || true
-          
+
           rosa edit machinepool \
             --cluster=${{ github.event.inputs.cluster_name }} \
             --replicas=0 workers 2>/dev/null || true
-          
+
           echo "✅ Spot configured"
 
       - name: Create admin
@@ -361,10 +361,10 @@ jobs:
         run: |
           API_URL=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.api.url')
           CONSOLE_URL=$(rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.console.url')
-          
+
           echo "api_url=${API_URL}" >> $GITHUB_OUTPUT
           echo "console_url=${CONSOLE_URL}" >> $GITHUB_OUTPUT
-          
+
           rosa describe cluster --cluster=${{ github.event.inputs.cluster_name }}
           rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
 
