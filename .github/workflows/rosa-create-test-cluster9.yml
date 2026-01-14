@@ -99,10 +99,6 @@ jobs:
           echo "   Workers: ${{ github.event.inputs.worker_count }}"
           echo ""
 
-          rosa link account-role --role-arn arn:aws:iam::364817831286:role/ManagedOpenShift-HCP-ROSA-Installer-Role
-          rosa create oidc-config -m auto
-          echo "   CREATEED OIDC CONFIG -m auto"
-
           # Create cluster with STS (recommended)
           rosa create cluster \
             --cluster-name=${{ github.event.inputs.cluster_name }} \
