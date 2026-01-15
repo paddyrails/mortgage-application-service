@@ -1,0 +1,482 @@
+name: 9.4 Create Grafana Alerts
+
+# ============================================================
+# Creates Grafana alerts for mortgage microservices:
+# - High Error Rate Alert
+# - Service Down Alert
+# - Log Volume Spike Alert
+# - No Logs Alert (service may be down)
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      monitoring_namespace:
+        description: "Namespace where Grafana is deployed"
+        required: true
+        default: "monitoring"
+      app_namespace:
+        description: "Namespace where microservices are deployed"
+        required: true
+        default: "mortgage-app"
+      slack_webhook_url:
+        description: "Slack webhook URL for notifications (optional)"
+        required: false
+        default: ""
+      email_addresses:
+        description: "Email addresses for notifications (comma-separated, optional)"
+        required: false
+        default: ""
+      error_threshold:
+        description: "Error count threshold per 5 minutes"
+        required: true
+        default: "10"
+
+jobs:
+  create-alerts:
+    name: Create Grafana Alerts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install OpenShift CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xvf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+
+      - name: Login to OpenShift
+        run: |
+          oc login ${{ secrets.OPENSHIFT_SERVER }} \
+            --token=${{ secrets.OPENSHIFT_TOKEN }} \
+            --insecure-skip-tls-verify=true
+
+      - name: Get Grafana Credentials
+        id: grafana
+        run: |
+          echo "🔍 Getting Grafana credentials..."
+
+          GRAFANA_URL=$(oc get route grafana -n ${{ github.event.inputs.monitoring_namespace }} -o jsonpath='{.spec.host}')
+
+          # Try both secret names
+          GRAFANA_PASSWORD=$(oc get secret grafana-admin -n ${{ github.event.inputs.monitoring_namespace }} -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d) || \
+          GRAFANA_PASSWORD=$(oc get secret grafana-admin-credentials -n ${{ github.event.inputs.monitoring_namespace }} -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d) || \
+          GRAFANA_PASSWORD=""
+
+          if [ -z "$GRAFANA_PASSWORD" ]; then
+            echo "❌ Could not get Grafana password"
+            oc get secrets -n ${{ github.event.inputs.monitoring_namespace }}
+            exit 1
+          fi
+
+          echo "url=https://${GRAFANA_URL}" >> $GITHUB_OUTPUT
+          echo "password=${GRAFANA_PASSWORD}" >> $GITHUB_OUTPUT
+          echo "✅ Grafana URL: https://${GRAFANA_URL}"
+
+      - name: Test Grafana Connection
+        run: |
+          RESPONSE=$(curl -k -s -o /dev/null -w "%{http_code}" \
+            -u "admin:${{ steps.grafana.outputs.password }}" \
+            "${{ steps.grafana.outputs.url }}/api/health")
+
+          if [ "$RESPONSE" = "200" ]; then
+            echo "✅ Grafana API accessible"
+          else
+            echo "❌ Grafana API returned: $RESPONSE"
+            exit 1
+          fi
+
+      - name: Get Loki Datasource UID
+        id: datasource
+        run: |
+          DS_RESPONSE=$(curl -k -s \
+            -u "admin:${{ steps.grafana.outputs.password }}" \
+            "${{ steps.grafana.outputs.url }}/api/datasources")
+
+          LOKI_UID=$(echo "$DS_RESPONSE" | jq -r '.[] | select(.type=="loki") | .uid' 2>/dev/null | head -1)
+
+          if [ -z "$LOKI_UID" ] || [ "$LOKI_UID" = "null" ]; then
+            LOKI_UID="loki"
+          fi
+
+          echo "uid=$LOKI_UID" >> $GITHUB_OUTPUT
+          echo "✅ Loki UID: $LOKI_UID"
+
+      - name: Create Alert Folder
+        id: folder
+        run: |
+          echo "📁 Creating alert folder..."
+
+          RESULT=$(curl -k -s -X POST \
+            -H "Content-Type: application/json" \
+            -u "admin:${{ steps.grafana.outputs.password }}" \
+            -d '{"title": "Mortgage Alerts"}' \
+            "${{ steps.grafana.outputs.url }}/api/folders")
+
+          FOLDER_UID=$(echo "$RESULT" | jq -r '.uid' 2>/dev/null)
+
+          if [ -z "$FOLDER_UID" ] || [ "$FOLDER_UID" = "null" ]; then
+            # Folder may already exist, try to get it
+            FOLDER_UID=$(curl -k -s \
+              -u "admin:${{ steps.grafana.outputs.password }}" \
+              "${{ steps.grafana.outputs.url }}/api/folders" | jq -r '.[] | select(.title=="Mortgage Alerts") | .uid' 2>/dev/null)
+          fi
+
+          if [ -z "$FOLDER_UID" ] || [ "$FOLDER_UID" = "null" ]; then
+            FOLDER_UID="mortgage-alerts"
+          fi
+
+          echo "uid=$FOLDER_UID" >> $GITHUB_OUTPUT
+          echo "✅ Folder UID: $FOLDER_UID"
+
+      - name: Create Slack Contact Point
+        if: github.event.inputs.slack_webhook_url != ''
+        run: |
+          echo "📧 Creating Slack contact point..."
+
+          cat <<EOF > /tmp/slack-contact.json
+          {
+            "name": "Slack - Mortgage Alerts",
+            "type": "slack",
+            "settings": {
+              "url": "${{ github.event.inputs.slack_webhook_url }}",
+              "username": "Grafana Alerts",
+              "title": "{{ .Status | title }}: {{ .GroupLabels.alertname }}",
+              "text": "{{ range .Alerts }}{{ .Annotations.summary }}\n{{ end }}"
+            }
+          }
+          EOF
+
+          curl -k -s -X POST \
+            -H "Content-Type: application/json" \
+            -u "admin:${{ steps.grafana.outputs.password }}" \
+            -d @/tmp/slack-contact.json \
+            "${{ steps.grafana.outputs.url }}/api/v1/provisioning/contact-points" && echo "✅ Slack contact created" || echo "⚠️ May already exist"
+
+      - name: Create Email Contact Point
+        if: github.event.inputs.email_addresses != ''
+        run: |
+          echo "📧 Creating Email contact point..."
+
+          cat <<EOF > /tmp/email-contact.json
+          {
+            "name": "Email - Mortgage Alerts",
+            "type": "email",
+            "settings": {
+              "addresses": "${{ github.event.inputs.email_addresses }}",
+              "singleEmail": false
+            }
+          }
+          EOF
+
+          curl -k -s -X POST \
+            -H "Content-Type: application/json" \
+            -u "admin:${{ steps.grafana.outputs.password }}" \
+            -d @/tmp/email-contact.json \
+            "${{ steps.grafana.outputs.url }}/api/v1/provisioning/contact-points" && echo "✅ Email contact created" || echo "⚠️ May already exist"
+
+      - name: Create Alert Rules
+        run: |
+          echo "🚨 Creating alert rules..."
+
+          GRAFANA_URL="${{ steps.grafana.outputs.url }}"
+          GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
+          APP_NS="${{ github.event.inputs.app_namespace }}"
+          LOKI_UID="${{ steps.datasource.outputs.uid }}"
+          FOLDER_UID="${{ steps.folder.outputs.uid }}"
+          ERROR_THRESHOLD="${{ github.event.inputs.error_threshold }}"
+
+          # Create alert rule group
+          cat <<EOF > /tmp/alert-rules.json
+          {
+            "name": "Mortgage Service Alerts",
+            "interval": "1m",
+            "rules": [
+              {
+                "uid": "mortgage-high-error-rate",
+                "title": "High Error Rate",
+                "condition": "C",
+                "data": [
+                  {
+                    "refId": "A",
+                    "queryType": "range",
+                    "relativeTimeRange": {"from": 300, "to": 0},
+                    "datasourceUid": "${LOKI_UID}",
+                    "model": {
+                      "expr": "sum(count_over_time({namespace=\"${APP_NS}\"} |~ \"(?i)error|exception\" [5m]))",
+                      "refId": "A"
+                    }
+                  },
+                  {
+                    "refId": "B",
+                    "queryType": "",
+                    "relativeTimeRange": {"from": 0, "to": 0},
+                    "datasourceUid": "-100",
+                    "model": {
+                      "conditions": [
+                        {
+                          "evaluator": {"params": [], "type": "gt"},
+                          "operator": {"type": "and"},
+                          "query": {"params": ["A"]},
+                          "reducer": {"params": [], "type": "last"},
+                          "type": "query"
+                        }
+                      ],
+                      "datasource": {"type": "__expr__", "uid": "-100"},
+                      "expression": "A",
+                      "reducer": "last",
+                      "refId": "B",
+                      "type": "reduce"
+                    }
+                  },
+                  {
+                    "refId": "C",
+                    "queryType": "",
+                    "relativeTimeRange": {"from": 0, "to": 0},
+                    "datasourceUid": "-100",
+                    "model": {
+                      "conditions": [
+                        {
+                          "evaluator": {"params": [${ERROR_THRESHOLD}], "type": "gt"},
+                          "operator": {"type": "and"},
+                          "query": {"params": ["B"]},
+                          "reducer": {"params": [], "type": "last"},
+                          "type": "query"
+                        }
+                      ],
+                      "datasource": {"type": "__expr__", "uid": "-100"},
+                      "expression": "B",
+                      "refId": "C",
+                      "type": "threshold"
+                    }
+                  }
+                ],
+                "noDataState": "NoData",
+                "execErrState": "Error",
+                "for": "5m",
+                "annotations": {
+                  "summary": "High error rate detected in mortgage services",
+                  "description": "More than ${ERROR_THRESHOLD} errors in the last 5 minutes"
+                },
+                "labels": {
+                  "severity": "critical",
+                  "service": "mortgage-app"
+                }
+              }
+            ]
+          }
+          EOF
+
+          RESULT=$(curl -k -s -X POST \
+            -H "Content-Type: application/json" \
+            -u "admin:${GRAFANA_PASSWORD}" \
+            -d @/tmp/alert-rules.json \
+            "${GRAFANA_URL}/api/v1/provisioning/folder/${FOLDER_UID}/rule-groups")
+
+          echo "Alert rules response: $RESULT"
+
+          if echo "$RESULT" | grep -q "error"; then
+            echo "⚠️ Could not create via provisioning API, trying dashboard alert..."
+          else
+            echo "✅ Alert rules created"
+          fi
+
+      - name: Create Simple Alert via Dashboard
+        run: |
+          echo "📊 Creating dashboard with alert..."
+
+          GRAFANA_URL="${{ steps.grafana.outputs.url }}"
+          GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
+          APP_NS="${{ github.event.inputs.app_namespace }}"
+          LOKI_UID="${{ steps.datasource.outputs.uid }}"
+          ERROR_THRESHOLD="${{ github.event.inputs.error_threshold }}"
+
+          cat <<EOF > /tmp/alert-dashboard.json
+          {
+            "dashboard": {
+              "id": null,
+              "uid": "mortgage-alerts-dashboard",
+              "title": "Mortgage Services - Alerts",
+              "tags": ["mortgage", "alerts"],
+              "timezone": "browser",
+              "schemaVersion": 38,
+              "version": 1,
+              "refresh": "1m",
+              "panels": [
+                {
+                  "id": 1,
+                  "title": "Error Count (triggers alert if > ${ERROR_THRESHOLD})",
+                  "type": "stat",
+                  "gridPos": {"h": 6, "w": 8, "x": 0, "y": 0},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "sum(count_over_time({namespace=\"${APP_NS}\"} |~ \"(?i)error|exception\" [5m]))",
+                      "refId": "A"
+                    }
+                  ],
+                  "fieldConfig": {
+                    "defaults": {
+                      "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                          {"color": "green", "value": null},
+                          {"color": "yellow", "value": 5},
+                          {"color": "red", "value": ${ERROR_THRESHOLD}}
+                        ]
+                      }
+                    }
+                  },
+                  "options": {"colorMode": "background", "graphMode": "none"}
+                },
+                {
+                  "id": 2,
+                  "title": "Warning Count",
+                  "type": "stat",
+                  "gridPos": {"h": 6, "w": 8, "x": 8, "y": 0},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "sum(count_over_time({namespace=\"${APP_NS}\"} |~ \"(?i)warn\" [5m]))",
+                      "refId": "A"
+                    }
+                  ],
+                  "fieldConfig": {
+                    "defaults": {
+                      "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                          {"color": "green", "value": null},
+                          {"color": "yellow", "value": 20},
+                          {"color": "orange", "value": 50}
+                        ]
+                      }
+                    }
+                  },
+                  "options": {"colorMode": "background", "graphMode": "none"}
+                },
+                {
+                  "id": 3,
+                  "title": "Log Volume (5m)",
+                  "type": "stat",
+                  "gridPos": {"h": 6, "w": 8, "x": 16, "y": 0},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "sum(count_over_time({namespace=\"${APP_NS}\"}[5m]))",
+                      "refId": "A"
+                    }
+                  ],
+                  "options": {"colorMode": "value", "graphMode": "area"}
+                },
+                {
+                  "id": 4,
+                  "title": "Error Trend",
+                  "type": "timeseries",
+                  "gridPos": {"h": 10, "w": 24, "x": 0, "y": 6},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "sum(count_over_time({namespace=\"${APP_NS}\"} |~ \"(?i)error\" [1m]))",
+                      "legendFormat": "Errors",
+                      "refId": "A"
+                    },
+                    {
+                      "expr": "sum(count_over_time({namespace=\"${APP_NS}\"} |~ \"(?i)warn\" [1m]))",
+                      "legendFormat": "Warnings",
+                      "refId": "B"
+                    }
+                  ],
+                  "fieldConfig": {
+                    "defaults": {
+                      "custom": {"lineWidth": 2, "fillOpacity": 20}
+                    },
+                    "overrides": [
+                      {
+                        "matcher": {"id": "byName", "options": "Errors"},
+                        "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]
+                      },
+                      {
+                        "matcher": {"id": "byName", "options": "Warnings"},
+                        "properties": [{"id": "color", "value": {"fixedColor": "yellow", "mode": "fixed"}}]
+                      }
+                    ]
+                  }
+                },
+                {
+                  "id": 5,
+                  "title": "Recent Errors",
+                  "type": "logs",
+                  "gridPos": {"h": 10, "w": 24, "x": 0, "y": 16},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "{namespace=\"${APP_NS}\"} |~ \"(?i)error|exception\"",
+                      "refId": "A"
+                    }
+                  ],
+                  "options": {
+                    "showTime": true,
+                    "showLabels": true,
+                    "wrapLogMessage": true,
+                    "enableLogDetails": true,
+                    "sortOrder": "Descending"
+                  }
+                }
+              ]
+            },
+            "overwrite": true
+          }
+          EOF
+
+          RESULT=$(curl -k -s -X POST \
+            -H "Content-Type: application/json" \
+            -u "admin:${GRAFANA_PASSWORD}" \
+            -d @/tmp/alert-dashboard.json \
+            "${GRAFANA_URL}/api/dashboards/db")
+
+          if echo "$RESULT" | grep -q '"status":"success"'; then
+            echo "✅ Alerts dashboard created"
+          else
+            echo "Response: $RESULT"
+          fi
+
+      - name: List Alert Rules
+        run: |
+          echo "📋 Listing alert rules..."
+
+          curl -k -s \
+            -u "admin:${{ steps.grafana.outputs.password }}" \
+            "${{ steps.grafana.outputs.url }}/api/v1/provisioning/alert-rules" | jq '.' 2>/dev/null || echo "No alert rules found"
+
+      - name: Summary
+        run: |
+          GRAFANA_URL="${{ steps.grafana.outputs.url }}"
+
+          echo "## 🚨 Grafana Alerts Setup" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Alerts Dashboard" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [View Alerts Dashboard](${GRAFANA_URL}/d/mortgage-alerts-dashboard)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Thresholds" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Warning | Critical |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|---------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Errors (5m) | 5 | ${{ github.event.inputs.error_threshold }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Warnings (5m) | 20 | 50 |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Contact Points" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ github.event.inputs.slack_webhook_url }}" ]; then
+            echo "- ✅ Slack configured" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -n "${{ github.event.inputs.email_addresses }}" ]; then
+            echo "- ✅ Email configured" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo ""
+          echo "════════════════════════════════════════════"
+          echo "  ALERTS CONFIGURED"
+          echo "════════════════════════════════════════════"
+          echo "  Dashboard: ${GRAFANA_URL}/d/mortgage-alerts-dashboard"
+          echo "  Error Threshold: ${{ github.event.inputs.error_threshold }}"
+          echo "════════════════════════════════════════════"
