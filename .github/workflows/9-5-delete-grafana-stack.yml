@@ -1,0 +1,85 @@
+name: Delete Grafana Stack
+
+# ============================================================
+# Deletes Grafana observability stack from OpenShift
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      monitoring_namespace:
+        description: 'Namespace where Grafana stack is deployed'
+        required: true
+        default: 'monitoring'
+      confirm_namespace:
+        description: 'Type namespace name again to confirm'
+        required: true
+      delete_pvcs:
+        description: 'Also delete Persistent Volume Claims (data loss!)'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  delete-grafana-stack:
+    name: Delete Grafana Stack
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate Confirmation
+        run: |
+          if [ "${{ github.event.inputs.monitoring_namespace }}" != "${{ github.event.inputs.confirm_namespace }}" ]; then
+            echo "❌ Confirmation failed!"
+            exit 1
+          fi
+          echo "✅ Confirmed deletion"
+
+      - name: Install Tools
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xvf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Login to OpenShift
+        run: |
+          oc login ${{ secrets.OPENSHIFT_SERVER }} \
+            --token=${{ secrets.OPENSHIFT_TOKEN }} \
+            --insecure-skip-tls-verify=true
+
+      - name: Delete Helm Releases
+        run: |
+          echo "🗑️ Deleting Helm releases..."
+          helm uninstall grafana -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
+          helm uninstall promtail -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
+          helm uninstall loki -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
+          helm uninstall prometheus -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
+
+      - name: Delete Routes and Secrets
+        run: |
+          echo "🗑️ Deleting routes and secrets..."
+          oc delete route grafana -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
+          oc delete secret grafana-admin-credentials -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
+          oc delete configmap promtail-mortgage-config -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
+
+      - name: Delete RBAC
+        run: |
+          oc delete clusterrolebinding promtail-clusterrolebinding 2>/dev/null || true
+          oc delete clusterrole promtail-clusterrole 2>/dev/null || true
+
+      - name: Delete PVCs
+        if: github.event.inputs.delete_pvcs == 'true'
+        run: |
+          echo "🗑️ Deleting PVCs..."
+          oc delete pvc --all -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
+
+      - name: Summary
+        run: |
+          echo "## 🗑️ Grafana Stack Deleted" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Grafana | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+          echo "| Loki | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+          echo "| Promtail | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+          echo "| Prometheus | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY

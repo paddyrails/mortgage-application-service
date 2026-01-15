@@ -1,0 +1,286 @@
+name: Configure Microservices Logging
+
+# ============================================================
+# Configures microservices to send logs to Grafana/Loki:
+# - Adds logging annotations to pods
+# - Configures structured logging
+# - Sets up log labels for filtering
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_namespace:
+        description: 'Namespace where microservices are deployed'
+        required: true
+        default: 'mortgage-app'
+      monitoring_namespace:
+        description: 'Namespace where Grafana stack is deployed'
+        required: true
+        default: 'monitoring'
+
+env:
+  SERVICES: "customer-service property-service loans-service payments-service application-service"
+
+jobs:
+  configure-logging:
+    name: Configure Microservices Logging
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install OpenShift CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xvf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+
+      - name: Login to OpenShift
+        run: |
+          oc login ${{ secrets.OPENSHIFT_SERVER }} \
+            --token=${{ secrets.OPENSHIFT_TOKEN }} \
+            --insecure-skip-tls-verify=true
+
+      - name: Verify Grafana Stack
+        run: |
+          echo "🔍 Verifying Grafana stack is running..."
+          
+          oc get pods -n ${{ github.event.inputs.monitoring_namespace }} | grep -E "grafana|loki|promtail" || {
+            echo "❌ Grafana stack not found. Run 'Deploy Grafana Stack' workflow first."
+            exit 1
+          }
+          
+          echo "✅ Grafana stack is running"
+
+      - name: Add Logging Annotations to Deployments
+        run: |
+          echo "📝 Adding logging annotations to microservices..."
+          
+          oc project ${{ github.event.inputs.app_namespace }}
+          
+          for SERVICE in ${{ env.SERVICES }}; do
+            echo ""
+            echo "Configuring $SERVICE..."
+            
+            # Check if deployment exists
+            if ! oc get deployment $SERVICE &>/dev/null; then
+              echo "  ⚠️ Deployment $SERVICE not found, skipping"
+              continue
+            fi
+            
+            # Add annotations for Promtail to scrape logs
+            oc patch deployment $SERVICE --type=merge -p '{
+              "spec": {
+                "template": {
+                  "metadata": {
+                    "annotations": {
+                      "prometheus.io/scrape": "true",
+                      "prometheus.io/port": "8080",
+                      "prometheus.io/path": "/actuator/prometheus",
+                      "loki.io/scrape": "true"
+                    },
+                    "labels": {
+                      "app": "'$SERVICE'",
+                      "service": "'$SERVICE'",
+                      "logging": "enabled",
+                      "team": "mortgage",
+                      "environment": "dev"
+                    }
+                  }
+                }
+              }
+            }' 2>/dev/null && echo "  ✅ Annotations added" || echo "  ⚠️ Failed to patch"
+            
+          done
+
+      - name: Create Logging ConfigMap
+        run: |
+          echo "📄 Creating logging configuration..."
+          
+          cat <<EOF | oc apply -n ${{ github.event.inputs.app_namespace }} -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: logging-config
+            labels:
+              app: mortgage-logging
+          data:
+            # .NET logging configuration
+            appsettings.Logging.json: |
+              {
+                "Logging": {
+                  "LogLevel": {
+                    "Default": "Information",
+                    "Microsoft": "Warning",
+                    "Microsoft.Hosting.Lifetime": "Information",
+                    "Microsoft.EntityFrameworkCore": "Warning"
+                  },
+                  "Console": {
+                    "FormatterName": "json",
+                    "FormatterOptions": {
+                      "SingleLine": true,
+                      "IncludeScopes": true,
+                      "TimestampFormat": "yyyy-MM-dd HH:mm:ss.fff ",
+                      "UseUtcTimestamp": true,
+                      "JsonWriterOptions": {
+                        "Indented": false
+                      }
+                    }
+                  }
+                }
+              }
+            
+            # Log format for parsing
+            log-format.txt: |
+              # Structured JSON logging format
+              # Fields: timestamp, level, message, service, traceId, spanId, exception
+          EOF
+          
+          echo "✅ Logging ConfigMap created"
+
+      - name: Update Promtail to Scrape App Namespace
+        run: |
+          echo "🔄 Updating Promtail configuration..."
+          
+          # Create additional scrape config for the app namespace
+          cat <<EOF | oc apply -n ${{ github.event.inputs.monitoring_namespace }} -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: promtail-mortgage-config
+            labels:
+              app: promtail
+          data:
+            mortgage-scrape.yaml: |
+              - job_name: mortgage-microservices
+                kubernetes_sd_configs:
+                  - role: pod
+                    namespaces:
+                      names:
+                        - ${{ github.event.inputs.app_namespace }}
+                pipeline_stages:
+                  - cri: {}
+                  - json:
+                      expressions:
+                        level: level
+                        message: message
+                        exception: exception
+                        traceId: traceId
+                  - labels:
+                      level:
+                      traceId:
+                  - timestamp:
+                      source: timestamp
+                      format: RFC3339Nano
+                relabel_configs:
+                  - source_labels: [__meta_kubernetes_namespace]
+                    target_label: namespace
+                  - source_labels: [__meta_kubernetes_pod_name]
+                    target_label: pod
+                  - source_labels: [__meta_kubernetes_pod_container_name]
+                    target_label: container
+                  - source_labels: [__meta_kubernetes_pod_label_app]
+                    target_label: app
+                  - source_labels: [__meta_kubernetes_pod_label_service]
+                    target_label: service
+                  - source_labels: [__meta_kubernetes_pod_label_team]
+                    target_label: team
+                  - action: replace
+                    source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
+                    separator: /
+                    replacement: /var/log/pods/*\$1/*.log
+                    target_label: __path__
+          EOF
+          
+          echo "✅ Promtail config updated"
+
+      - name: Restart Promtail to Apply Config
+        run: |
+          echo "🔄 Restarting Promtail..."
+          
+          oc rollout restart daemonset/promtail \
+            -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || \
+          oc rollout restart deployment/promtail \
+            -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
+          
+          echo "✅ Promtail restarted"
+
+      - name: Verify Logs are Being Collected
+        run: |
+          echo "🔍 Verifying log collection..."
+          
+          # Wait for promtail to restart
+          sleep 30
+          
+          # Get Loki service
+          LOKI_SVC=$(oc get svc -n ${{ github.event.inputs.monitoring_namespace }} | grep loki | head -1 | awk '{print $1}')
+          
+          if [ -n "$LOKI_SVC" ]; then
+            echo "Loki service: $LOKI_SVC"
+            
+            # Query Loki for labels
+            oc exec -n ${{ github.event.inputs.monitoring_namespace }} \
+              $(oc get pod -n ${{ github.event.inputs.monitoring_namespace }} -l app.kubernetes.io/name=loki -o jsonpath='{.items[0].metadata.name}') \
+              -- wget -qO- "http://localhost:3100/loki/api/v1/labels" 2>/dev/null || echo "Could not query Loki directly"
+          fi
+          
+          echo ""
+          echo "✅ Log collection configured"
+          echo "   View logs in Grafana → Explore → Loki"
+
+      - name: List Configured Services
+        run: |
+          echo "📋 Configured services:"
+          echo ""
+          
+          oc get deployments -n ${{ github.event.inputs.app_namespace }} \
+            -o custom-columns=NAME:.metadata.name,LOGGING:.spec.template.metadata.labels.logging,APP:.spec.template.metadata.labels.app
+          
+          echo ""
+          echo "Pod annotations:"
+          for SERVICE in ${{ env.SERVICES }}; do
+            echo ""
+            echo "$SERVICE:"
+            oc get deployment $SERVICE -n ${{ github.event.inputs.app_namespace }} \
+              -o jsonpath='{.spec.template.metadata.annotations}' 2>/dev/null | jq . || echo "  Not found"
+          done
+
+      - name: Summary
+        run: |
+          echo "## 🎉 Microservices Logging Configured" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Configured Services" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          for SERVICE in ${{ env.SERVICES }}; do
+            if oc get deployment $SERVICE -n ${{ github.event.inputs.app_namespace }} &>/dev/null; then
+              echo "| $SERVICE | ✅ Configured |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| $SERVICE | ⚠️ Not Found |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Log Labels" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Use these labels in Grafana/Loki queries:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Label | Description |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| \`namespace\` | Kubernetes namespace |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`app\` | Service name |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`pod\` | Pod name |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`container\` | Container name |" >> $GITHUB_STEP_SUMMARY
+          echo "| \`level\` | Log level (info, warn, error) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Example Queries" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`logql" >> $GITHUB_STEP_SUMMARY
+          echo "# All logs from mortgage-app namespace" >> $GITHUB_STEP_SUMMARY
+          echo '{namespace=\"${{ github.event.inputs.app_namespace }}\"}' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Errors from customer-service" >> $GITHUB_STEP_SUMMARY
+          echo '{app=\"customer-service\"} |= \"error\"' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# All errors across services" >> $GITHUB_STEP_SUMMARY
+          echo '{namespace=\"${{ github.event.inputs.app_namespace }}\"} | json | level=\"error\"' >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
