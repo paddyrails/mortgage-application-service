@@ -1,4 +1,4 @@
-name: Deploy Grafana Stack
+name: 9.1 Deploy Grafana Stack
 
 # ============================================================
 # Deploys Grafana + Loki + Promtail on OpenShift
@@ -9,22 +9,22 @@ on:
   workflow_dispatch:
     inputs:
       namespace:
-        description: 'Namespace for Grafana stack'
+        description: "Namespace for Grafana stack"
         required: true
-        default: 'monitoring'
+        default: "monitoring"
       grafana_admin_password:
-        description: 'Grafana admin password (leave empty for auto-generated)'
+        description: "Grafana admin password (leave empty for auto-generated)"
         required: false
-        default: ''
+        default: ""
       storage_size:
-        description: 'Storage size for Loki'
+        description: "Storage size for Loki"
         required: true
-        default: '10Gi'
+        default: "10Gi"
         type: choice
         options:
-          - '5Gi'
-          - '10Gi'
-          - '20Gi'
+          - "5Gi"
+          - "10Gi"
+          - "20Gi"
 
 env:
   APP_NAMESPACE: mortgage-app
@@ -47,31 +47,31 @@ jobs:
           oc login ${{ secrets.OPENSHIFT_SERVER }} \
             --token=${{ secrets.OPENSHIFT_TOKEN }} \
             --insecure-skip-tls-verify=true
-          
+
           echo "✅ Logged in to OpenShift"
           oc whoami
 
       - name: Create Namespace and Grant SCCs
         run: |
           echo "📁 Creating namespace ${{ github.event.inputs.namespace }}..."
-          
+
           oc create namespace ${{ github.event.inputs.namespace }} 2>/dev/null || echo "Namespace already exists"
           oc project ${{ github.event.inputs.namespace }}
-          
+
           echo "🔐 Granting Security Context Constraints..."
-          
+
           # Create service accounts first
           oc create serviceaccount loki -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
           oc create serviceaccount grafana -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
           oc create serviceaccount promtail -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
-          
+
           # Grant anyuid to loki and grafana (they need to run as specific users)
           oc adm policy add-scc-to-user anyuid -z loki -n ${{ github.event.inputs.namespace }} || echo "May need admin for SCC"
           oc adm policy add-scc-to-user anyuid -z grafana -n ${{ github.event.inputs.namespace }} || echo "May need admin for SCC"
-          
+
           # Grant privileged to promtail (needs to read host logs)
           oc adm policy add-scc-to-user privileged -z promtail -n ${{ github.event.inputs.namespace }} || echo "May need admin for SCC"
-          
+
           echo "✅ SCCs granted"
 
       - name: Generate Grafana Password
@@ -88,7 +88,7 @@ jobs:
       - name: Deploy Loki
         run: |
           echo "📦 Deploying Loki..."
-          
+
           cat <<'YAML' | oc apply -n ${{ github.event.inputs.namespace }} -f -
           ---
           apiVersion: v1
@@ -135,9 +135,9 @@ jobs:
               analytics:
                 reporting_enabled: false
           YAML
-          
+
           echo "✅ Loki ConfigMap created"
-          
+
           cat <<YAML | oc apply -n ${{ github.event.inputs.namespace }} -f -
           ---
           apiVersion: v1
@@ -153,9 +153,9 @@ jobs:
               requests:
                 storage: ${{ github.event.inputs.storage_size }}
           YAML
-          
+
           echo "✅ Loki PVC created"
-          
+
           cat <<'YAML' | oc apply -n ${{ github.event.inputs.namespace }} -f -
           ---
           apiVersion: apps/v1
@@ -234,13 +234,13 @@ jobs:
             selector:
               app: loki
           YAML
-          
+
           echo "✅ Loki Deployment and Service created"
 
       - name: Wait for Loki
         run: |
           echo "⏳ Waiting for Loki to start..."
-          
+
           for i in {1..30}; do
             STATUS=$(oc get pods -n ${{ github.event.inputs.namespace }} -l app=loki -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "Pending")
             echo "  Attempt $i: Loki status = $STATUS"
@@ -259,13 +259,13 @@ jobs:
             
             sleep 10
           done
-          
+
           oc get pods -n ${{ github.event.inputs.namespace }} -l app=loki
 
       - name: Deploy Promtail
         run: |
           echo "📦 Deploying Promtail..."
-          
+
           cat <<'YAML' | oc apply -n ${{ github.event.inputs.namespace }} -f -
           ---
           apiVersion: rbac.authorization.k8s.io/v1
@@ -290,13 +290,13 @@ jobs:
               name: promtail
               namespace: NAMESPACE_PLACEHOLDER
           YAML
-          
+
           # Fix namespace in ClusterRoleBinding
           oc patch clusterrolebinding promtail --type='json' \
             -p='[{"op": "replace", "path": "/subjects/0/namespace", "value": "${{ github.event.inputs.namespace }}"}]' || true
-          
+
           echo "✅ Promtail RBAC created"
-          
+
           cat <<YAML | oc apply -n ${{ github.event.inputs.namespace }} -f -
           ---
           apiVersion: v1
@@ -334,9 +334,9 @@ jobs:
                       source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
                       target_label: __path__
           YAML
-          
+
           echo "✅ Promtail ConfigMap created"
-          
+
           cat <<'YAML' | oc apply -n ${{ github.event.inputs.namespace }} -f -
           ---
           apiVersion: apps/v1
@@ -392,22 +392,22 @@ jobs:
                     hostPath:
                       path: /var/log/pods
           YAML
-          
+
           echo "✅ Promtail DaemonSet created"
 
       - name: Deploy Grafana
         run: |
           echo "📦 Deploying Grafana..."
-          
+
           # Create Grafana secret
           oc create secret generic grafana-admin \
             --from-literal=admin-user=admin \
             --from-literal=admin-password="${{ steps.password.outputs.password }}" \
             -n ${{ github.event.inputs.namespace }} \
             --dry-run=client -o yaml | oc apply -f -
-          
+
           echo "✅ Grafana secret created"
-          
+
           cat <<'YAML' | oc apply -n ${{ github.event.inputs.namespace }} -f -
           ---
           apiVersion: v1
@@ -520,14 +520,14 @@ jobs:
             selector:
               app: grafana
           YAML
-          
+
           echo "✅ Grafana Deployment and Service created"
 
       - name: Create Grafana Route
         id: route
         run: |
           echo "🌐 Creating Grafana route..."
-          
+
           cat <<'YAML' | oc apply -n ${{ github.event.inputs.namespace }} -f -
           apiVersion: route.openshift.io/v1
           kind: Route
@@ -545,7 +545,7 @@ jobs:
               termination: edge
               insecureEdgeTerminationPolicy: Redirect
           YAML
-          
+
           sleep 5
           GRAFANA_URL=$(oc get route grafana -n ${{ github.event.inputs.namespace }} -o jsonpath='{.spec.host}')
           echo "url=https://${GRAFANA_URL}" >> $GITHUB_OUTPUT
@@ -554,21 +554,21 @@ jobs:
       - name: Wait for All Pods
         run: |
           echo "⏳ Waiting for all pods to be ready..."
-          
+
           echo ""
           echo "Waiting for Loki..."
           oc rollout status deployment/loki -n ${{ github.event.inputs.namespace }} --timeout=180s || {
             echo "⚠️ Loki rollout issue. Checking events..."
             oc describe deployment loki -n ${{ github.event.inputs.namespace }} | tail -20
           }
-          
+
           echo ""
           echo "Waiting for Grafana..."
           oc rollout status deployment/grafana -n ${{ github.event.inputs.namespace }} --timeout=180s || {
             echo "⚠️ Grafana rollout issue. Checking events..."
             oc describe deployment grafana -n ${{ github.event.inputs.namespace }} | tail -20
           }
-          
+
           echo ""
           echo "Waiting for Promtail..."
           sleep 10
@@ -578,22 +578,22 @@ jobs:
         run: |
           echo "🔍 Verifying deployment..."
           echo ""
-          
+
           echo "=== Pods ==="
           oc get pods -n ${{ github.event.inputs.namespace }}
-          
+
           echo ""
           echo "=== Services ==="
           oc get svc -n ${{ github.event.inputs.namespace }}
-          
+
           echo ""
           echo "=== Routes ==="
           oc get routes -n ${{ github.event.inputs.namespace }}
-          
+
           echo ""
           echo "=== PVCs ==="
           oc get pvc -n ${{ github.event.inputs.namespace }}
-          
+
           # Check for any pod issues
           echo ""
           echo "=== Pod Details ==="
@@ -602,7 +602,7 @@ jobs:
             oc get $POD -n ${{ github.event.inputs.namespace }} -o jsonpath='{.status.phase}'
             echo ""
           done
-          
+
           echo ""
           echo "=== Recent Events ==="
           oc get events -n ${{ github.event.inputs.namespace }} --sort-by='.lastTimestamp' | tail -15
@@ -610,9 +610,9 @@ jobs:
       - name: Test Loki Connection
         run: |
           echo "🧪 Testing Loki..."
-          
+
           LOKI_POD=$(oc get pod -n ${{ github.event.inputs.namespace }} -l app=loki -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-          
+
           if [ -n "$LOKI_POD" ]; then
             echo "Loki pod: $LOKI_POD"
             echo ""
@@ -643,7 +643,7 @@ jobs:
           echo "| Grafana | Dashboards & Visualization |" >> $GITHUB_STEP_SUMMARY
           echo "| Loki | Log Aggregation |" >> $GITHUB_STEP_SUMMARY
           echo "| Promtail | Log Collection |" >> $GITHUB_STEP_SUMMARY
-          
+
           echo ""
           echo "════════════════════════════════════════════════════════════"
           echo "  GRAFANA STACK DEPLOYMENT COMPLETE"

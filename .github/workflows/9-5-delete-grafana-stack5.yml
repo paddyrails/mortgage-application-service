@@ -1,4 +1,4 @@
-name: Delete Grafana Stack
+name: 9.5 Delete Grafana Stack
 
 # ============================================================
 # Deletes Grafana observability stack from OpenShift:
@@ -13,19 +13,19 @@ on:
   workflow_dispatch:
     inputs:
       monitoring_namespace:
-        description: 'Namespace where Grafana stack is deployed'
+        description: "Namespace where Grafana stack is deployed"
         required: true
-        default: 'monitoring'
+        default: "monitoring"
       confirm_namespace:
-        description: 'Type namespace name again to confirm deletion'
+        description: "Type namespace name again to confirm deletion"
         required: true
       delete_pvcs:
-        description: 'Also delete Persistent Volume Claims (data will be lost!)'
+        description: "Also delete Persistent Volume Claims (data will be lost!)"
         required: true
         default: true
         type: boolean
       delete_namespace:
-        description: 'Delete the entire namespace'
+        description: "Delete the entire namespace"
         required: true
         default: false
         type: boolean
@@ -77,7 +77,7 @@ jobs:
       - name: Delete Grafana
         run: |
           echo "🗑️ Deleting Grafana..."
-          
+
           oc delete deployment grafana -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Grafana deployment deleted" || echo "⚠️ Not found"
           oc delete service grafana -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Grafana service deleted" || echo "⚠️ Not found"
           oc delete route grafana -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Grafana route deleted" || echo "⚠️ Not found"
@@ -87,7 +87,7 @@ jobs:
       - name: Delete Loki
         run: |
           echo "🗑️ Deleting Loki..."
-          
+
           oc delete deployment loki -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Loki deployment deleted" || echo "⚠️ Not found"
           oc delete service loki -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Loki service deleted" || echo "⚠️ Not found"
           oc delete configmap loki-config -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Loki configmap deleted" || echo "⚠️ Not found"
@@ -95,14 +95,14 @@ jobs:
       - name: Delete Promtail
         run: |
           echo "🗑️ Deleting Promtail..."
-          
+
           oc delete daemonset promtail -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Promtail daemonset deleted" || echo "⚠️ Not found"
           oc delete configmap promtail-config -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Promtail configmap deleted" || echo "⚠️ Not found"
 
       - name: Remove SCCs from Service Accounts
         run: |
           echo "🔐 Removing Security Context Constraints..."
-          
+
           oc adm policy remove-scc-from-user anyuid -z loki -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Removed anyuid from loki" || echo "⚠️ Not found"
           oc adm policy remove-scc-from-user anyuid -z grafana -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Removed anyuid from grafana" || echo "⚠️ Not found"
           oc adm policy remove-scc-from-user privileged -z promtail -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Removed privileged from promtail" || echo "⚠️ Not found"
@@ -110,7 +110,7 @@ jobs:
       - name: Delete Service Accounts
         run: |
           echo "🗑️ Deleting Service Accounts..."
-          
+
           oc delete sa loki -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Loki SA deleted" || echo "⚠️ Not found"
           oc delete sa grafana -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Grafana SA deleted" || echo "⚠️ Not found"
           oc delete sa promtail -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Promtail SA deleted" || echo "⚠️ Not found"
@@ -118,7 +118,7 @@ jobs:
       - name: Delete Cluster RBAC Resources
         run: |
           echo "🗑️ Deleting Cluster RBAC resources..."
-          
+
           oc delete clusterrolebinding promtail 2>/dev/null && echo "✅ ClusterRoleBinding deleted" || echo "⚠️ Not found"
           oc delete clusterrole promtail 2>/dev/null && echo "✅ ClusterRole deleted" || echo "⚠️ Not found"
 
@@ -126,27 +126,27 @@ jobs:
         if: github.event.inputs.delete_pvcs == 'true'
         run: |
           echo "🗑️ Deleting PVCs (data will be permanently lost!)..."
-          
+
           oc delete pvc loki-data -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Loki PVC deleted" || echo "⚠️ Not found"
           oc delete pvc grafana-data -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Grafana PVC deleted" || echo "⚠️ Not found"
-          
+
           # Delete any remaining PVCs
           oc delete pvc --all -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
-          
+
           echo "✅ All PVCs deleted"
 
       - name: Delete Namespace
         if: github.event.inputs.delete_namespace == 'true'
         run: |
           echo "🗑️ Deleting namespace ${{ github.event.inputs.monitoring_namespace }}..."
-          
+
           oc delete namespace ${{ github.event.inputs.monitoring_namespace }} --timeout=120s 2>/dev/null && echo "✅ Namespace deleted" || echo "⚠️ Namespace deletion may be in progress"
 
       - name: Verify Deletion
         run: |
           echo "🔍 Verifying deletion..."
           echo ""
-          
+
           if [ "${{ github.event.inputs.delete_namespace }}" == "true" ]; then
             if oc get namespace ${{ github.event.inputs.monitoring_namespace }} &>/dev/null; then
               echo "⚠️ Namespace still exists (may be terminating)"
@@ -189,7 +189,7 @@ jobs:
           echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "To redeploy, run the **Deploy Grafana Stack** workflow." >> $GITHUB_STEP_SUMMARY
-          
+
           echo ""
           echo "════════════════════════════════════════════════════════════"
           echo "  ✅ GRAFANA STACK DELETED"
