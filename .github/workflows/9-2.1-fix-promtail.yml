@@ -1,0 +1,284 @@
+name: 9.2.1 Fix Promtail Log Collection
+
+# ============================================================
+# Diagnoses and fixes Promtail log collection issues
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: "Namespace where Grafana stack is deployed"
+        required: true
+        default: "monitoring"
+
+jobs:
+  fix-promtail:
+    name: Fix Promtail
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install OpenShift CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xvf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+
+      - name: Login to OpenShift
+        run: |
+          oc login ${{ secrets.OPENSHIFT_SERVER }} \
+            --token=${{ secrets.OPENSHIFT_TOKEN }} \
+            --insecure-skip-tls-verify=true
+
+      - name: Check Current Status
+        run: |
+          echo "🔍 Current Promtail Status..."
+          echo ""
+
+          echo "=== Promtail Pods ==="
+          oc get pods -n ${{ github.event.inputs.namespace }} -l app=promtail -o wide
+
+          echo ""
+          echo "=== Promtail Logs ==="
+          oc logs -n ${{ github.event.inputs.namespace }} -l app=promtail --tail=30 2>/dev/null || echo "No logs"
+
+          echo ""
+          echo "=== Loki Pods ==="
+          oc get pods -n ${{ github.event.inputs.namespace }} -l app=loki
+
+          echo ""
+          echo "=== Check Loki is receiving data ==="
+          LOKI_POD=$(oc get pod -n ${{ github.event.inputs.namespace }} -l app=loki -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          if [ -n "$LOKI_POD" ]; then
+            echo "Loki labels:"
+            oc exec -n ${{ github.event.inputs.namespace }} $LOKI_POD -- wget -qO- 'http://localhost:3100/loki/api/v1/labels' 2>/dev/null || echo "Could not query"
+          fi
+
+      - name: Grant Privileged SCC to Promtail
+        run: |
+          echo "🔐 Granting privileged SCC to Promtail..."
+
+          # This is the key fix - Promtail MUST have privileged access
+          oc adm policy add-scc-to-user privileged -z promtail -n ${{ github.event.inputs.namespace }} || echo "May need cluster-admin"
+          oc adm policy add-scc-to-user hostaccess -z promtail -n ${{ github.event.inputs.namespace }} || true
+
+          echo "✅ SCC granted"
+
+      - name: Delete and Recreate Promtail
+        run: |
+          echo "🔄 Recreating Promtail with fixed config..."
+
+          # Delete existing
+          oc delete daemonset promtail -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
+          oc delete configmap promtail-config -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
+
+          sleep 5
+
+          # Create new ConfigMap with better config
+          cat <<'EOF' | oc apply -n ${{ github.event.inputs.namespace }} -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: promtail-config
+          data:
+            promtail.yaml: |
+              server:
+                http_listen_port: 9080
+                grpc_listen_port: 0
+              
+              positions:
+                filename: /run/promtail/positions.yaml
+              
+              clients:
+                - url: http://loki:3100/loki/api/v1/push
+                  tenant_id: fake
+              
+              scrape_configs:
+                # Scrape logs from all pods
+                - job_name: kubernetes-pods
+                  kubernetes_sd_configs:
+                    - role: pod
+                  pipeline_stages:
+                    - cri: {}
+                  relabel_configs:
+                    # Keep all pods
+                    - action: replace
+                      source_labels: [__meta_kubernetes_namespace]
+                      target_label: namespace
+                    - action: replace
+                      source_labels: [__meta_kubernetes_pod_name]
+                      target_label: pod
+                    - action: replace
+                      source_labels: [__meta_kubernetes_pod_container_name]
+                      target_label: container
+                    - action: replace
+                      source_labels: [__meta_kubernetes_pod_label_app]
+                      target_label: app
+                    - action: replace
+                      source_labels: [__meta_kubernetes_pod_node_name]
+                      target_label: node
+                    # Set the log file path
+                    - action: replace
+                      replacement: /var/log/pods/*$1/*.log
+                      separator: /
+                      source_labels:
+                        - __meta_kubernetes_pod_uid
+                        - __meta_kubernetes_pod_container_name
+                      target_label: __path__
+          EOF
+
+          echo "✅ ConfigMap created"
+
+          # Create DaemonSet with all required mounts
+          cat <<'EOF' | oc apply -n ${{ github.event.inputs.namespace }} -f -
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: promtail
+            labels:
+              app: promtail
+          spec:
+            selector:
+              matchLabels:
+                app: promtail
+            template:
+              metadata:
+                labels:
+                  app: promtail
+              spec:
+                serviceAccountName: promtail
+                securityContext:
+                  runAsUser: 0
+                  runAsGroup: 0
+                containers:
+                  - name: promtail
+                    image: grafana/promtail:2.9.4
+                    args:
+                      - -config.file=/etc/promtail/promtail.yaml
+                      - -client.external-labels=cluster=openshift
+                    securityContext:
+                      privileged: true
+                      runAsUser: 0
+                      readOnlyRootFilesystem: false
+                      allowPrivilegeEscalation: true
+                    env:
+                      - name: HOSTNAME
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: spec.nodeName
+                    ports:
+                      - containerPort: 9080
+                        name: http
+                    resources:
+                      requests:
+                        cpu: 50m
+                        memory: 64Mi
+                      limits:
+                        cpu: 200m
+                        memory: 256Mi
+                    volumeMounts:
+                      - name: config
+                        mountPath: /etc/promtail
+                      - name: run
+                        mountPath: /run/promtail
+                      - name: varlog
+                        mountPath: /var/log
+                        readOnly: true
+                      - name: varlibdockercontainers
+                        mountPath: /var/lib/docker/containers
+                        readOnly: true
+                      - name: pods
+                        mountPath: /var/log/pods
+                        readOnly: true
+                    readinessProbe:
+                      httpGet:
+                        path: /ready
+                        port: 9080
+                      initialDelaySeconds: 10
+                tolerations:
+                  - operator: Exists
+                    effect: NoSchedule
+                  - operator: Exists
+                    effect: NoExecute
+                volumes:
+                  - name: config
+                    configMap:
+                      name: promtail-config
+                  - name: run
+                    emptyDir: {}
+                  - name: varlog
+                    hostPath:
+                      path: /var/log
+                  - name: varlibdockercontainers
+                    hostPath:
+                      path: /var/lib/docker/containers
+                  - name: pods
+                    hostPath:
+                      path: /var/log/pods
+          EOF
+
+          echo "✅ DaemonSet created"
+
+      - name: Wait for Promtail
+        run: |
+          echo "⏳ Waiting for Promtail pods..."
+          sleep 20
+
+          oc get pods -n ${{ github.event.inputs.namespace }} -l app=promtail -o wide
+
+          echo ""
+          echo "=== Promtail Logs ==="
+          oc logs -n ${{ github.event.inputs.namespace }} -l app=promtail --tail=50 2>/dev/null | head -50
+
+      - name: Check Log Files on Node
+        run: |
+          echo "🔍 Checking what log files exist..."
+
+          PROMTAIL_POD=$(oc get pod -n ${{ github.event.inputs.namespace }} -l app=promtail -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+          if [ -n "$PROMTAIL_POD" ]; then
+            echo "=== /var/log/pods structure ==="
+            oc exec -n ${{ github.event.inputs.namespace }} $PROMTAIL_POD -- ls -la /var/log/pods/ 2>/dev/null | head -20 || echo "Cannot list"
+            
+            echo ""
+            echo "=== Sample log file ==="
+            oc exec -n ${{ github.event.inputs.namespace }} $PROMTAIL_POD -- sh -c 'find /var/log/pods -name "*.log" 2>/dev/null | head -5' || echo "Cannot find logs"
+          fi
+
+      - name: Verify Loki Receiving Data
+        run: |
+          echo "🧪 Checking if Loki is receiving data..."
+          sleep 30
+
+          LOKI_POD=$(oc get pod -n ${{ github.event.inputs.namespace }} -l app=loki -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+          if [ -n "$LOKI_POD" ]; then
+            echo "=== Loki Labels ==="
+            oc exec -n ${{ github.event.inputs.namespace }} $LOKI_POD -- wget -qO- 'http://localhost:3100/loki/api/v1/labels' 2>/dev/null
+            
+            echo ""
+            echo "=== Loki Label Values for namespace ==="
+            oc exec -n ${{ github.event.inputs.namespace }} $LOKI_POD -- wget -qO- 'http://localhost:3100/loki/api/v1/label/namespace/values' 2>/dev/null
+            
+            echo ""
+            echo "=== Sample Query ==="
+            oc exec -n ${{ github.event.inputs.namespace }} $LOKI_POD -- wget -qO- 'http://localhost:3100/loki/api/v1/query?query=%7Bnamespace%3D%22monitoring%22%7D&limit=5' 2>/dev/null | head -100
+          fi
+
+      - name: Summary
+        run: |
+          echo ""
+          echo "════════════════════════════════════════════"
+          echo "  PROMTAIL FIX COMPLETE"
+          echo "════════════════════════════════════════════"
+          echo ""
+          echo "  Next steps:"
+          echo "  1. Go to Grafana → Explore"
+          echo "  2. Select Loki datasource"
+          echo "  3. Try query: {job=\"kubernetes-pods\"}"
+          echo "  4. Or: {namespace=\"monitoring\"}"
+          echo ""
+          echo "  If still no logs, check Promtail logs:"
+          echo "  oc logs -n ${{ github.event.inputs.namespace }} -l app=promtail"
+          echo ""
+          echo "════════════════════════════════════════════"
