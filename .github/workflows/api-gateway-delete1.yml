@@ -1,0 +1,295 @@
+name: Delete API Gateway
+
+# ============================================================
+# Deletes AWS API Gateway and related resources
+# 
+# Resources deleted:
+# - API Gateway (HTTP API)
+# - All Routes
+# - All Integrations
+# - Stage
+# - CloudWatch Log Group (optional)
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_gateway_name:
+        description: 'API Gateway name (without environment suffix)'
+        required: true
+        default: 'mortgage-api'
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      confirm_name:
+        description: 'Type API Gateway name again to confirm'
+        required: true
+      delete_logs:
+        description: 'Also delete CloudWatch logs'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  delete-api-gateway:
+    name: Delete API Gateway
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate confirmation
+        run: |
+          EXPECTED="${{ github.event.inputs.api_gateway_name }}"
+          CONFIRMED="${{ github.event.inputs.confirm_name }}"
+          
+          if [ "$EXPECTED" != "$CONFIRMED" ]; then
+            echo "❌ Confirmation failed!"
+            echo "   Expected: $EXPECTED"
+            echo "   Got: $CONFIRMED"
+            exit 1
+          fi
+          
+          echo "✅ Confirmed deletion of: $EXPECTED-${{ github.event.inputs.environment }}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Find API Gateway
+        id: find-api
+        run: |
+          echo "🔍 Finding API Gateway..."
+          
+          API_NAME="${{ github.event.inputs.api_gateway_name }}-${{ github.event.inputs.environment }}"
+          
+          API_ID=$(aws apigatewayv2 get-apis \
+            --query "Items[?Name=='${API_NAME}'].ApiId" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -z "$API_ID" ] || [ "$API_ID" == "None" ]; then
+            echo "⚠️ API Gateway '$API_NAME' not found"
+            echo "exists=false" >> $GITHUB_OUTPUT
+            
+            echo ""
+            echo "Available API Gateways:"
+            aws apigatewayv2 get-apis --query 'Items[*].[Name,ApiId]' --output table
+          else
+            echo "✅ Found API Gateway: $API_ID"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "api_id=$API_ID" >> $GITHUB_OUTPUT
+            echo "api_name=$API_NAME" >> $GITHUB_OUTPUT
+            
+            echo ""
+            echo "API Details:"
+            aws apigatewayv2 get-api --api-id $API_ID
+          fi
+
+      - name: List Routes and Integrations
+        if: steps.find-api.outputs.exists == 'true'
+        run: |
+          echo "📋 Current Routes:"
+          aws apigatewayv2 get-routes \
+            --api-id ${{ steps.find-api.outputs.api_id }} \
+            --query 'Items[*].[RouteKey,RouteId]' \
+            --output table 2>/dev/null || echo "No routes found"
+          
+          echo ""
+          echo "📋 Current Integrations:"
+          aws apigatewayv2 get-integrations \
+            --api-id ${{ steps.find-api.outputs.api_id }} \
+            --query 'Items[*].[IntegrationId,IntegrationType,IntegrationUri]' \
+            --output table 2>/dev/null || echo "No integrations found"
+          
+          echo ""
+          echo "📋 Current Stages:"
+          aws apigatewayv2 get-stages \
+            --api-id ${{ steps.find-api.outputs.api_id }} \
+            --query 'Items[*].[StageName,AutoDeploy]' \
+            --output table 2>/dev/null || echo "No stages found"
+
+      - name: Delete Routes
+        if: steps.find-api.outputs.exists == 'true'
+        run: |
+          echo "🗑️ Deleting routes..."
+          
+          API_ID="${{ steps.find-api.outputs.api_id }}"
+          
+          ROUTES=$(aws apigatewayv2 get-routes \
+            --api-id $API_ID \
+            --query 'Items[*].RouteId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$ROUTES" ] && [ "$ROUTES" != "None" ]; then
+            for ROUTE_ID in $ROUTES; do
+              echo "  Deleting route: $ROUTE_ID"
+              aws apigatewayv2 delete-route \
+                --api-id $API_ID \
+                --route-id $ROUTE_ID 2>/dev/null || true
+            done
+            echo "✅ Routes deleted"
+          else
+            echo "No routes to delete"
+          fi
+
+      - name: Delete Integrations
+        if: steps.find-api.outputs.exists == 'true'
+        run: |
+          echo "🗑️ Deleting integrations..."
+          
+          API_ID="${{ steps.find-api.outputs.api_id }}"
+          
+          INTEGRATIONS=$(aws apigatewayv2 get-integrations \
+            --api-id $API_ID \
+            --query 'Items[*].IntegrationId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$INTEGRATIONS" ] && [ "$INTEGRATIONS" != "None" ]; then
+            for INT_ID in $INTEGRATIONS; do
+              echo "  Deleting integration: $INT_ID"
+              aws apigatewayv2 delete-integration \
+                --api-id $API_ID \
+                --integration-id $INT_ID 2>/dev/null || true
+            done
+            echo "✅ Integrations deleted"
+          else
+            echo "No integrations to delete"
+          fi
+
+      - name: Delete Stages
+        if: steps.find-api.outputs.exists == 'true'
+        run: |
+          echo "🗑️ Deleting stages..."
+          
+          API_ID="${{ steps.find-api.outputs.api_id }}"
+          
+          STAGES=$(aws apigatewayv2 get-stages \
+            --api-id $API_ID \
+            --query 'Items[*].StageName' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$STAGES" ] && [ "$STAGES" != "None" ]; then
+            for STAGE in $STAGES; do
+              # Skip $default stage as it can't be deleted directly
+              if [ "$STAGE" != "\$default" ]; then
+                echo "  Deleting stage: $STAGE"
+                aws apigatewayv2 delete-stage \
+                  --api-id $API_ID \
+                  --stage-name $STAGE 2>/dev/null || true
+              fi
+            done
+            echo "✅ Stages deleted"
+          else
+            echo "No stages to delete"
+          fi
+
+      - name: Delete VPC Link (if exists)
+        if: steps.find-api.outputs.exists == 'true'
+        run: |
+          echo "🗑️ Checking for VPC Links..."
+          
+          VPC_LINK_NAME="${{ github.event.inputs.api_gateway_name }}-vpc-link"
+          
+          VPC_LINK_ID=$(aws apigatewayv2 get-vpc-links \
+            --query "Items[?Name=='${VPC_LINK_NAME}'].VpcLinkId" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$VPC_LINK_ID" ] && [ "$VPC_LINK_ID" != "None" ]; then
+            echo "  Deleting VPC Link: $VPC_LINK_ID"
+            aws apigatewayv2 delete-vpc-link \
+              --vpc-link-id $VPC_LINK_ID 2>/dev/null || true
+            
+            echo "  ⏳ Waiting for VPC Link deletion..."
+            sleep 30
+            echo "✅ VPC Link deleted"
+          else
+            echo "No VPC Link found"
+          fi
+
+      - name: Delete API Gateway
+        if: steps.find-api.outputs.exists == 'true'
+        run: |
+          echo "🗑️ Deleting API Gateway..."
+          
+          API_ID="${{ steps.find-api.outputs.api_id }}"
+          API_NAME="${{ steps.find-api.outputs.api_name }}"
+          
+          aws apigatewayv2 delete-api --api-id $API_ID
+          
+          echo "✅ API Gateway '$API_NAME' deleted"
+
+      - name: Delete CloudWatch Logs
+        if: steps.find-api.outputs.exists == 'true' && github.event.inputs.delete_logs == 'true'
+        run: |
+          echo "🗑️ Deleting CloudWatch logs..."
+          
+          LOG_GROUP="/aws/apigateway/${{ github.event.inputs.api_gateway_name }}-${{ github.event.inputs.environment }}"
+          
+          if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --query 'logGroups[0].logGroupName' --output text 2>/dev/null | grep -q "$LOG_GROUP"; then
+            aws logs delete-log-group --log-group-name "$LOG_GROUP" 2>/dev/null || true
+            echo "✅ Log group deleted: $LOG_GROUP"
+          else
+            echo "No log group found: $LOG_GROUP"
+          fi
+
+      - name: Verify Deletion
+        run: |
+          echo "🔍 Verifying deletion..."
+          
+          API_NAME="${{ github.event.inputs.api_gateway_name }}-${{ github.event.inputs.environment }}"
+          
+          REMAINING=$(aws apigatewayv2 get-apis \
+            --query "Items[?Name=='${API_NAME}'].ApiId" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -z "$REMAINING" ] || [ "$REMAINING" == "None" ]; then
+            echo "✅ API Gateway successfully deleted"
+          else
+            echo "⚠️ API Gateway may still exist: $REMAINING"
+          fi
+          
+          echo ""
+          echo "Remaining API Gateways:"
+          aws apigatewayv2 get-apis --query 'Items[*].[Name,ApiId]' --output table 2>/dev/null || echo "None"
+
+      - name: Summary
+        run: |
+          echo "## 🗑️ API Gateway Deleted" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deleted Resources" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.find-api.outputs.exists }}" == "true" ]; then
+            echo "| API Gateway | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Routes | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Integrations | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            echo "| Stages | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ github.event.inputs.delete_logs }}" == "true" ]; then
+              echo "| CloudWatch Logs | ✅ Deleted |" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "| API Gateway | ⚠️ Not Found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Name | \`${{ github.event.inputs.api_gateway_name }}-${{ github.event.inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | \`${{ github.event.inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | \`${{ env.AWS_REGION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "To recreate the API Gateway, run the **Create API Gateway for Microservices** workflow." >> $GITHUB_STEP_SUMMARY

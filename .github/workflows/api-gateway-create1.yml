@@ -1,0 +1,451 @@
+name: Create API Gateway for Microservices
+
+# ============================================================
+# Creates AWS API Gateway to route traffic to OpenShift services
+# 
+# Architecture:
+#   Internet → API Gateway → OpenShift Routes (HTTPS)
+#
+# Endpoints created:
+#   /api/customers/*     → customer-service
+#   /api/properties/*    → property-service
+#   /api/loans/*         → loans-service
+#   /api/payments/*      → payments-service
+#   /api/applications/*  → application-service
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'OpenShift cluster name'
+        required: true
+        default: 'mortgage-test'
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      api_gateway_name:
+        description: 'API Gateway name'
+        required: true
+        default: 'mortgage-api'
+
+env:
+  AWS_REGION: us-east-1
+  OPENSHIFT_NAMESPACE: mortgage-app
+
+jobs:
+  create-api-gateway:
+    name: Create API Gateway
+    runs-on: ubuntu-latest
+    
+    outputs:
+      api_gateway_id: ${{ steps.create-api.outputs.api_id }}
+      api_endpoint: ${{ steps.deploy-api.outputs.endpoint }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install OpenShift CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xvf openshift-client-linux.tar.gz
+          sudo mv oc /usr/local/bin/
+
+      - name: Login to OpenShift
+        run: |
+          oc login ${{ secrets.OPENSHIFT_SERVER }} \
+            --token=${{ secrets.OPENSHIFT_TOKEN }} \
+            --insecure-skip-tls-verify=true
+
+      - name: Get OpenShift Route URLs
+        id: routes
+        run: |
+          echo "🔍 Getting OpenShift route URLs..."
+          
+          oc project ${{ env.OPENSHIFT_NAMESPACE }}
+          
+          echo ""
+          echo "Available routes:"
+          oc get routes
+          echo ""
+          
+          # Get route URLs for each service (these are the public HTTPS endpoints)
+          CUSTOMER_URL=$(oc get route customer-service -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+          PROPERTY_URL=$(oc get route property-service -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+          LOANS_URL=$(oc get route loans-service -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+          PAYMENTS_URL=$(oc get route payments-service -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+          APPLICATION_URL=$(oc get route application-service -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+          
+          # Validate routes exist
+          MISSING_ROUTES=""
+          [ -z "$CUSTOMER_URL" ] && MISSING_ROUTES="$MISSING_ROUTES customer-service"
+          [ -z "$PROPERTY_URL" ] && MISSING_ROUTES="$MISSING_ROUTES property-service"
+          [ -z "$LOANS_URL" ] && MISSING_ROUTES="$MISSING_ROUTES loans-service"
+          [ -z "$PAYMENTS_URL" ] && MISSING_ROUTES="$MISSING_ROUTES payments-service"
+          [ -z "$APPLICATION_URL" ] && MISSING_ROUTES="$MISSING_ROUTES application-service"
+          
+          if [ -n "$MISSING_ROUTES" ]; then
+            echo "⚠️ Warning: Missing routes:$MISSING_ROUTES"
+            echo "   These services won't be added to API Gateway"
+          fi
+          
+          echo "customer_url=$CUSTOMER_URL" >> $GITHUB_OUTPUT
+          echo "property_url=$PROPERTY_URL" >> $GITHUB_OUTPUT
+          echo "loans_url=$LOANS_URL" >> $GITHUB_OUTPUT
+          echo "payments_url=$PAYMENTS_URL" >> $GITHUB_OUTPUT
+          echo "application_url=$APPLICATION_URL" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "📊 Route URLs:"
+          [ -n "$CUSTOMER_URL" ] && echo "  ✅ Customer:    https://$CUSTOMER_URL" || echo "  ❌ Customer:    NOT FOUND"
+          [ -n "$PROPERTY_URL" ] && echo "  ✅ Property:    https://$PROPERTY_URL" || echo "  ❌ Property:    NOT FOUND"
+          [ -n "$LOANS_URL" ] && echo "  ✅ Loans:       https://$LOANS_URL" || echo "  ❌ Loans:       NOT FOUND"
+          [ -n "$PAYMENTS_URL" ] && echo "  ✅ Payments:    https://$PAYMENTS_URL" || echo "  ❌ Payments:    NOT FOUND"
+          [ -n "$APPLICATION_URL" ] && echo "  ✅ Application: https://$APPLICATION_URL" || echo "  ❌ Application: NOT FOUND"
+
+      - name: Test OpenShift Routes Directly
+        run: |
+          echo "🧪 Testing OpenShift routes directly..."
+          echo ""
+          
+          test_route() {
+            local name=$1
+            local url=$2
+            if [ -n "$url" ]; then
+              local status=$(curl -s -o /dev/null -w "%{http_code}" "https://${url}/api/health" --max-time 10 2>/dev/null || echo "000")
+              if [ "$status" == "200" ]; then
+                echo "  ✅ $name: HTTP $status"
+              else
+                echo "  ⚠️ $name: HTTP $status (may need different health path)"
+              fi
+            else
+              echo "  ⏭️ $name: Skipped (no route)"
+            fi
+          }
+          
+          test_route "Customer" "${{ steps.routes.outputs.customer_url }}"
+          test_route "Property" "${{ steps.routes.outputs.property_url }}"
+          test_route "Loans" "${{ steps.routes.outputs.loans_url }}"
+          test_route "Payments" "${{ steps.routes.outputs.payments_url }}"
+          test_route "Application" "${{ steps.routes.outputs.application_url }}"
+
+      - name: Create or Get API Gateway
+        id: create-api
+        run: |
+          echo "🚀 Creating API Gateway..."
+          
+          API_NAME="${{ github.event.inputs.api_gateway_name }}-${{ github.event.inputs.environment }}"
+          
+          # Check if API already exists
+          EXISTING_API=$(aws apigatewayv2 get-apis \
+            --query "Items[?Name=='${API_NAME}'].ApiId" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$EXISTING_API" ] && [ "$EXISTING_API" != "None" ]; then
+            echo "API Gateway already exists: $EXISTING_API"
+            echo "Deleting existing routes and integrations..."
+            
+            # Delete existing routes
+            for ROUTE_ID in $(aws apigatewayv2 get-routes --api-id $EXISTING_API --query 'Items[*].RouteId' --output text 2>/dev/null); do
+              [ -n "$ROUTE_ID" ] && [ "$ROUTE_ID" != "None" ] && \
+                aws apigatewayv2 delete-route --api-id $EXISTING_API --route-id $ROUTE_ID 2>/dev/null || true
+            done
+            
+            # Delete existing integrations
+            for INT_ID in $(aws apigatewayv2 get-integrations --api-id $EXISTING_API --query 'Items[*].IntegrationId' --output text 2>/dev/null); do
+              [ -n "$INT_ID" ] && [ "$INT_ID" != "None" ] && \
+                aws apigatewayv2 delete-integration --api-id $EXISTING_API --integration-id $INT_ID 2>/dev/null || true
+            done
+            
+            API_ID=$EXISTING_API
+          else
+            # Create HTTP API Gateway
+            API_ID=$(aws apigatewayv2 create-api \
+              --name "$API_NAME" \
+              --protocol-type HTTP \
+              --description "API Gateway for Mortgage Microservices (${{ github.event.inputs.environment }})" \
+              --cors-configuration '{
+                "AllowOrigins": ["*"],
+                "AllowMethods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+                "AllowHeaders": ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+                "ExposeHeaders": ["X-Request-Id"],
+                "MaxAge": 86400
+              }' \
+              --query 'ApiId' \
+              --output text)
+            
+            echo "✅ API Gateway created: $API_ID"
+          fi
+          
+          echo "api_id=$API_ID" >> $GITHUB_OUTPUT
+          echo "api_name=$API_NAME" >> $GITHUB_OUTPUT
+
+      - name: Create Integrations and Routes
+        run: |
+          echo "🛠️ Creating integrations and routes..."
+          
+          API_ID="${{ steps.create-api.outputs.api_id }}"
+          
+          # Function to create integration and routes for a service
+          create_service_routes() {
+            local SERVICE_NAME=$1
+            local BACKEND_HOST=$2
+            local API_PATH=$3
+            
+            if [ -z "$BACKEND_HOST" ] || [ "$BACKEND_HOST" == "None" ]; then
+              echo "⏭️ Skipping $SERVICE_NAME - no backend URL"
+              return
+            fi
+            
+            echo ""
+            echo "Creating routes for $SERVICE_NAME..."
+            echo "  Backend: https://${BACKEND_HOST}"
+            echo "  API Path: ${API_PATH}"
+            
+            # Create integration pointing to the OpenShift route
+            # The integration URI should be the base URL - API Gateway will append the path
+            INTEGRATION_ID=$(aws apigatewayv2 create-integration \
+              --api-id $API_ID \
+              --integration-type HTTP_PROXY \
+              --integration-method ANY \
+              --integration-uri "https://${BACKEND_HOST}${API_PATH}" \
+              --payload-format-version "1.0" \
+              --timeout-in-millis 30000 \
+              --query 'IntegrationId' \
+              --output text)
+            
+            if [ -z "$INTEGRATION_ID" ] || [ "$INTEGRATION_ID" == "None" ]; then
+              echo "  ❌ Failed to create integration"
+              return
+            fi
+            
+            echo "  ✅ Integration: $INTEGRATION_ID"
+            
+            # Create route for base path (e.g., GET /api/customers)
+            aws apigatewayv2 create-route \
+              --api-id $API_ID \
+              --route-key "ANY ${API_PATH}" \
+              --target "integrations/$INTEGRATION_ID" \
+              2>/dev/null && echo "  ✅ Route: ANY ${API_PATH}" || echo "  ⚠️ Route may already exist"
+            
+            # Create integration for proxy path (with path parameter)
+            PROXY_INTEGRATION_ID=$(aws apigatewayv2 create-integration \
+              --api-id $API_ID \
+              --integration-type HTTP_PROXY \
+              --integration-method ANY \
+              --integration-uri "https://${BACKEND_HOST}${API_PATH}/{proxy}" \
+              --payload-format-version "1.0" \
+              --timeout-in-millis 30000 \
+              --request-parameters "{\"overwrite:path\": \"\$request.path\"}" \
+              --query 'IntegrationId' \
+              --output text 2>/dev/null || echo "")
+            
+            if [ -n "$PROXY_INTEGRATION_ID" ] && [ "$PROXY_INTEGRATION_ID" != "None" ]; then
+              # Create route for proxy path (e.g., GET /api/customers/123)
+              aws apigatewayv2 create-route \
+                --api-id $API_ID \
+                --route-key "ANY ${API_PATH}/{proxy+}" \
+                --target "integrations/$PROXY_INTEGRATION_ID" \
+                2>/dev/null && echo "  ✅ Route: ANY ${API_PATH}/{proxy+}" || echo "  ⚠️ Proxy route may already exist"
+            fi
+          }
+          
+          # Create routes for each service
+          create_service_routes "customer-service" "${{ steps.routes.outputs.customer_url }}" "/api/customers"
+          create_service_routes "property-service" "${{ steps.routes.outputs.property_url }}" "/api/properties"
+          create_service_routes "loans-service" "${{ steps.routes.outputs.loans_url }}" "/api/loans"
+          create_service_routes "payments-service" "${{ steps.routes.outputs.payments_url }}" "/api/payments"
+          create_service_routes "application-service" "${{ steps.routes.outputs.application_url }}" "/api/applications"
+
+      - name: Create Root and Health Routes
+        run: |
+          echo "❤️ Creating root and health routes..."
+          
+          API_ID="${{ steps.create-api.outputs.api_id }}"
+          CUSTOMER_URL="${{ steps.routes.outputs.customer_url }}"
+          
+          # Create a root route that returns API info
+          # Using customer service health as the default health check
+          if [ -n "$CUSTOMER_URL" ]; then
+            # Health check integration
+            HEALTH_INT=$(aws apigatewayv2 create-integration \
+              --api-id $API_ID \
+              --integration-type HTTP_PROXY \
+              --integration-method GET \
+              --integration-uri "https://${CUSTOMER_URL}/api/health" \
+              --payload-format-version "1.0" \
+              --query 'IntegrationId' \
+              --output text 2>/dev/null || echo "")
+            
+            if [ -n "$HEALTH_INT" ] && [ "$HEALTH_INT" != "None" ]; then
+              aws apigatewayv2 create-route \
+                --api-id $API_ID \
+                --route-key "GET /health" \
+                --target "integrations/$HEALTH_INT" \
+                2>/dev/null && echo "✅ Health route created" || echo "⚠️ Health route may exist"
+              
+              # Also create root health check
+              aws apigatewayv2 create-route \
+                --api-id $API_ID \
+                --route-key "GET /" \
+                --target "integrations/$HEALTH_INT" \
+                2>/dev/null && echo "✅ Root route created" || echo "⚠️ Root route may exist"
+            fi
+          fi
+
+      - name: Deploy API Gateway
+        id: deploy-api
+        run: |
+          echo "🚀 Deploying API Gateway..."
+          
+          API_ID="${{ steps.create-api.outputs.api_id }}"
+          STAGE_NAME="${{ github.event.inputs.environment }}"
+          
+          # Check if stage exists
+          EXISTING_STAGE=$(aws apigatewayv2 get-stages \
+            --api-id $API_ID \
+            --query "Items[?StageName=='${STAGE_NAME}'].StageName" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -z "$EXISTING_STAGE" ] || [ "$EXISTING_STAGE" == "None" ]; then
+            # Create stage with auto-deploy
+            aws apigatewayv2 create-stage \
+              --api-id $API_ID \
+              --stage-name $STAGE_NAME \
+              --auto-deploy \
+              --description "Mortgage API - ${{ github.event.inputs.environment }}"
+            echo "✅ Stage created: $STAGE_NAME"
+          else
+            echo "✅ Stage already exists: $STAGE_NAME"
+          fi
+          
+          # Get the endpoint URL
+          ENDPOINT=$(aws apigatewayv2 get-api \
+            --api-id $API_ID \
+            --query 'ApiEndpoint' \
+            --output text)
+          
+          FULL_ENDPOINT="${ENDPOINT}/${STAGE_NAME}"
+          
+          echo "endpoint=$FULL_ENDPOINT" >> $GITHUB_OUTPUT
+          echo ""
+          echo "════════════════════════════════════════════════════"
+          echo "✅ API Gateway Deployed!"
+          echo "   Endpoint: $FULL_ENDPOINT"
+          echo "════════════════════════════════════════════════════"
+
+      - name: List Created Routes
+        run: |
+          echo "📋 Listing all routes..."
+          echo ""
+          
+          API_ID="${{ steps.create-api.outputs.api_id }}"
+          
+          aws apigatewayv2 get-routes --api-id $API_ID \
+            --query 'Items[*].[RouteKey]' \
+            --output table
+
+      - name: Test API Gateway Endpoints
+        run: |
+          echo "🧪 Testing API Gateway endpoints..."
+          echo ""
+          
+          ENDPOINT="${{ steps.deploy-api.outputs.endpoint }}"
+          
+          # Wait a moment for deployment to propagate
+          sleep 5
+          
+          test_endpoint() {
+            local name=$1
+            local path=$2
+            local url="${ENDPOINT}${path}"
+            local response=$(curl -s -w "\n%{http_code}" "$url" --max-time 10 2>/dev/null)
+            local body=$(echo "$response" | head -n -1)
+            local status=$(echo "$response" | tail -n 1)
+            
+            if [ "$status" == "200" ]; then
+              echo "✅ $name: HTTP $status"
+            elif [ "$status" == "404" ]; then
+              echo "❌ $name: HTTP $status (Not Found)"
+              echo "   URL: $url"
+            else
+              echo "⚠️ $name: HTTP $status"
+              echo "   URL: $url"
+            fi
+          }
+          
+          echo "Testing endpoints:"
+          echo ""
+          test_endpoint "Root" "/"
+          test_endpoint "Health" "/health"
+          test_endpoint "Customers" "/api/customers"
+          test_endpoint "Properties" "/api/properties"
+          test_endpoint "Loans" "/api/loans"
+          test_endpoint "Payments" "/api/payments"
+          test_endpoint "Applications" "/api/applications"
+          
+          echo ""
+          echo "════════════════════════════════════════════════════"
+          echo "Full test with verbose output for /api/customers:"
+          echo "════════════════════════════════════════════════════"
+          curl -v "${ENDPOINT}/api/customers" 2>&1 | head -50 || true
+
+      - name: Summary
+        run: |
+          ENDPOINT="${{ steps.deploy-api.outputs.endpoint }}"
+          
+          echo "## 🎉 API Gateway Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### API Gateway Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Name | \`${{ steps.create-api.outputs.api_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ID | \`${{ steps.create-api.outputs.api_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | \`${{ github.event.inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Endpoint | \`${ENDPOINT}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### API Endpoints" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Endpoint |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Health | \`GET ${ENDPOINT}/health\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Customers | \`${ENDPOINT}/api/customers\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Properties | \`${ENDPOINT}/api/properties\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Loans | \`${ENDPOINT}/api/loans\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Payments | \`${ENDPOINT}/api/payments\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Applications | \`${ENDPOINT}/api/applications\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Test Commands" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# Health check" >> $GITHUB_STEP_SUMMARY
+          echo "curl ${ENDPOINT}/health" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Get all customers" >> $GITHUB_STEP_SUMMARY
+          echo "curl ${ENDPOINT}/api/customers" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Get customer by ID" >> $GITHUB_STEP_SUMMARY
+          echo "curl ${ENDPOINT}/api/customers/1" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Backend Routes (OpenShift)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | OpenShift Route |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----------------|" >> $GITHUB_STEP_SUMMARY
+          [ -n "${{ steps.routes.outputs.customer_url }}" ] && echo "| Customers | \`https://${{ steps.routes.outputs.customer_url }}\` |" >> $GITHUB_STEP_SUMMARY
+          [ -n "${{ steps.routes.outputs.property_url }}" ] && echo "| Properties | \`https://${{ steps.routes.outputs.property_url }}\` |" >> $GITHUB_STEP_SUMMARY
+          [ -n "${{ steps.routes.outputs.loans_url }}" ] && echo "| Loans | \`https://${{ steps.routes.outputs.loans_url }}\` |" >> $GITHUB_STEP_SUMMARY
+          [ -n "${{ steps.routes.outputs.payments_url }}" ] && echo "| Payments | \`https://${{ steps.routes.outputs.payments_url }}\` |" >> $GITHUB_STEP_SUMMARY
+          [ -n "${{ steps.routes.outputs.application_url }}" ] && echo "| Applications | \`https://${{ steps.routes.outputs.application_url }}\` |" >> $GITHUB_STEP_SUMMARY
