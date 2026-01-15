@@ -1,4 +1,4 @@
-name: Deploy Grafana Stack
+name: 9.1 Deploy Grafana Stack
 
 # ============================================================
 # Deploys Grafana observability stack on OpenShift:
@@ -17,25 +17,25 @@ on:
   workflow_dispatch:
     inputs:
       namespace:
-        description: 'Namespace for Grafana stack'
+        description: "Namespace for Grafana stack"
         required: true
-        default: 'monitoring'
+        default: "monitoring"
       grafana_admin_password:
-        description: 'Grafana admin password (leave empty for auto-generated)'
+        description: "Grafana admin password (leave empty for auto-generated)"
         required: false
-        default: ''
+        default: ""
       storage_size:
-        description: 'Storage size for Loki'
+        description: "Storage size for Loki"
         required: true
-        default: '10Gi'
+        default: "10Gi"
         type: choice
         options:
-          - '5Gi'
-          - '10Gi'
-          - '20Gi'
-          - '50Gi'
+          - "5Gi"
+          - "10Gi"
+          - "20Gi"
+          - "50Gi"
       install_prometheus:
-        description: 'Also install Prometheus for metrics'
+        description: "Also install Prometheus for metrics"
         required: true
         default: true
         type: boolean
@@ -73,14 +73,14 @@ jobs:
       - name: Create Monitoring Namespace
         run: |
           echo "📁 Creating monitoring namespace..."
-          
+
           oc create namespace ${{ github.event.inputs.namespace }} 2>/dev/null || echo "Namespace exists"
-          
+
           # Add labels for OpenShift
           oc label namespace ${{ github.event.inputs.namespace }} \
             openshift.io/cluster-monitoring=true \
             --overwrite
-          
+
           oc project ${{ github.event.inputs.namespace }}
 
       - name: Generate Grafana Admin Password
@@ -91,16 +91,16 @@ jobs:
           else
             GRAFANA_PASSWORD=$(openssl rand -base64 12)
           fi
-          
+
           echo "password=$GRAFANA_PASSWORD" >> $GITHUB_OUTPUT
-          
+
           # Create secret for Grafana
           oc create secret generic grafana-admin-credentials \
             --from-literal=admin-user=admin \
             --from-literal=admin-password="$GRAFANA_PASSWORD" \
             -n ${{ github.event.inputs.namespace }} \
             --dry-run=client -o yaml | oc apply -f -
-          
+
           echo "✅ Grafana admin credentials created"
 
       - name: Add Helm Repositories
@@ -112,7 +112,7 @@ jobs:
       - name: Deploy Loki (Log Aggregation)
         run: |
           echo "📦 Deploying Loki..."
-          
+
           cat <<EOF > /tmp/loki-values.yaml
           loki:
             auth_enabled: false
@@ -129,7 +129,7 @@ jobs:
                   index:
                     prefix: index_
                     period: 24h
-          
+
           singleBinary:
             replicas: 1
             persistence:
@@ -142,10 +142,10 @@ jobs:
               limits:
                 cpu: 500m
                 memory: 512Mi
-          
+
           gateway:
             enabled: false
-          
+
           # Disable components not needed for single binary
           backend:
             replicas: 0
@@ -153,10 +153,10 @@ jobs:
             replicas: 0
           write:
             replicas: 0
-          
+
           test:
             enabled: false
-          
+
           monitoring:
             selfMonitoring:
               enabled: false
@@ -165,18 +165,18 @@ jobs:
             lokiCanary:
               enabled: false
           EOF
-          
+
           helm upgrade --install loki grafana/loki \
             -n ${{ github.event.inputs.namespace }} \
             -f /tmp/loki-values.yaml \
             --wait --timeout 10m
-          
+
           echo "✅ Loki deployed"
 
       - name: Deploy Promtail (Log Collector)
         run: |
           echo "📦 Deploying Promtail..."
-          
+
           cat <<EOF > /tmp/promtail-values.yaml
           config:
             clients:
@@ -244,7 +244,7 @@ jobs:
                       separator: /
                       replacement: /var/log/pods/*\$1/*.log
                       target_label: __path__
-          
+
           resources:
             requests:
               cpu: 50m
@@ -252,31 +252,31 @@ jobs:
             limits:
               cpu: 200m
               memory: 128Mi
-          
+
           tolerations:
             - operator: Exists
-          
+
           serviceAccount:
             create: true
             name: promtail
-          
+
           rbac:
             create: true
             pspEnabled: false
           EOF
-          
+
           helm upgrade --install promtail grafana/promtail \
             -n ${{ github.event.inputs.namespace }} \
             -f /tmp/promtail-values.yaml \
             --wait --timeout 5m
-          
+
           echo "✅ Promtail deployed"
 
       - name: Deploy Prometheus (Optional)
         if: github.event.inputs.install_prometheus == 'true'
         run: |
           echo "📦 Deploying Prometheus..."
-          
+
           cat <<EOF > /tmp/prometheus-values.yaml
           server:
             persistentVolume:
@@ -290,21 +290,21 @@ jobs:
                 cpu: 500m
                 memory: 512Mi
             retention: "7d"
-          
+
           alertmanager:
             enabled: true
             persistentVolume:
               enabled: false
-          
+
           pushgateway:
             enabled: false
-          
+
           nodeExporter:
             enabled: true
-          
+
           kubeStateMetrics:
             enabled: true
-          
+
           serverFiles:
             prometheus.yml:
               scrape_configs:
@@ -338,31 +338,31 @@ jobs:
                     - source_labels: [__meta_kubernetes_pod_label_app]
                       target_label: app
           EOF
-          
+
           helm upgrade --install prometheus prometheus-community/prometheus \
             -n ${{ github.event.inputs.namespace }} \
             -f /tmp/prometheus-values.yaml \
             --wait --timeout 10m
-          
+
           echo "✅ Prometheus deployed"
 
       - name: Deploy Grafana
         run: |
           echo "📦 Deploying Grafana..."
-          
+
           PROMETHEUS_URL=""
           if [ "${{ github.event.inputs.install_prometheus }}" == "true" ]; then
             PROMETHEUS_URL="http://prometheus-server:80"
           fi
-          
+
           cat <<EOF > /tmp/grafana-values.yaml
           adminUser: admin
           adminPassword: "${{ steps.grafana-secret.outputs.password }}"
-          
+
           persistence:
             enabled: true
             size: 5Gi
-          
+
           resources:
             requests:
               cpu: 100m
@@ -370,7 +370,7 @@ jobs:
             limits:
               cpu: 500m
               memory: 512Mi
-          
+
           datasources:
             datasources.yaml:
               apiVersion: 1
@@ -383,7 +383,7 @@ jobs:
                   jsonData:
                     maxLines: 1000
           EOF
-          
+
           # Add Prometheus datasource if installed
           if [ "${{ github.event.inputs.install_prometheus }}" == "true" ]; then
             cat <<EOF >> /tmp/grafana-values.yaml
@@ -394,9 +394,9 @@ jobs:
                   isDefault: false
           EOF
           fi
-          
+
           cat <<EOF >> /tmp/grafana-values.yaml
-          
+
           dashboardProviders:
             dashboardproviders.yaml:
               apiVersion: 1
@@ -409,7 +409,7 @@ jobs:
                   editable: true
                   options:
                     path: /var/lib/grafana/dashboards/default
-          
+
           sidecar:
             dashboards:
               enabled: true
@@ -419,7 +419,7 @@ jobs:
             datasources:
               enabled: true
               label: grafana_datasource
-          
+
           grafana.ini:
             server:
               root_url: "%(protocol)s://%(domain)s/"
@@ -431,24 +431,24 @@ jobs:
               enabled: true
             unified_alerting:
               enabled: true
-          
+
           service:
             type: ClusterIP
             port: 80
           EOF
-          
+
           helm upgrade --install grafana grafana/grafana \
             -n ${{ github.event.inputs.namespace }} \
             -f /tmp/grafana-values.yaml \
             --wait --timeout 5m
-          
+
           echo "✅ Grafana deployed"
 
       - name: Create Grafana Route
         id: grafana-route
         run: |
           echo "🌐 Creating Grafana route..."
-          
+
           # Check if route exists
           if oc get route grafana -n ${{ github.event.inputs.namespace }} &>/dev/null; then
             echo "Route already exists"
@@ -458,16 +458,16 @@ jobs:
               --port=3000 \
               -n ${{ github.event.inputs.namespace }}
           fi
-          
+
           GRAFANA_URL=$(oc get route grafana -n ${{ github.event.inputs.namespace }} -o jsonpath='{.spec.host}')
           echo "url=https://${GRAFANA_URL}" >> $GITHUB_OUTPUT
-          
+
           echo "✅ Grafana route: https://${GRAFANA_URL}"
 
       - name: Configure RBAC for Promtail
         run: |
           echo "🔐 Configuring RBAC..."
-          
+
           cat <<EOF | oc apply -f -
           apiVersion: rbac.authorization.k8s.io/v1
           kind: ClusterRole
@@ -494,30 +494,30 @@ jobs:
               name: promtail
               namespace: ${{ github.event.inputs.namespace }}
           EOF
-          
+
           # Grant privileged SCC for Promtail (needed to read pod logs)
           oc adm policy add-scc-to-user privileged \
             -z promtail \
             -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
-          
+
           echo "✅ RBAC configured"
 
       - name: Verify Deployment
         run: |
           echo "🔍 Verifying deployment..."
           echo ""
-          
+
           echo "Pods in ${{ github.event.inputs.namespace }}:"
           oc get pods -n ${{ github.event.inputs.namespace }}
-          
+
           echo ""
           echo "Services:"
           oc get svc -n ${{ github.event.inputs.namespace }}
-          
+
           echo ""
           echo "Routes:"
           oc get routes -n ${{ github.event.inputs.namespace }}
-          
+
           echo ""
           echo "PVCs:"
           oc get pvc -n ${{ github.event.inputs.namespace }}
@@ -525,12 +525,12 @@ jobs:
       - name: Wait for Pods Ready
         run: |
           echo "⏳ Waiting for pods to be ready..."
-          
+
           oc wait --for=condition=ready pod \
             -l app.kubernetes.io/name=grafana \
             -n ${{ github.event.inputs.namespace }} \
             --timeout=300s || true
-          
+
           oc wait --for=condition=ready pod \
             -l app.kubernetes.io/name=loki \
             -n ${{ github.event.inputs.namespace }} \

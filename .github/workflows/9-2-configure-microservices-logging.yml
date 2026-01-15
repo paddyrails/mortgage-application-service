@@ -1,4 +1,4 @@
-name: Configure Microservices Logging
+name: 9.2 Configure Microservices Logging
 
 # ============================================================
 # Configures microservices to send logs to Grafana/Loki:
@@ -11,13 +11,13 @@ on:
   workflow_dispatch:
     inputs:
       app_namespace:
-        description: 'Namespace where microservices are deployed'
+        description: "Namespace where microservices are deployed"
         required: true
-        default: 'mortgage-app'
+        default: "mortgage-app"
       monitoring_namespace:
-        description: 'Namespace where Grafana stack is deployed'
+        description: "Namespace where Grafana stack is deployed"
         required: true
-        default: 'monitoring'
+        default: "monitoring"
 
 env:
   SERVICES: "customer-service property-service loans-service payments-service application-service"
@@ -43,20 +43,20 @@ jobs:
       - name: Verify Grafana Stack
         run: |
           echo "🔍 Verifying Grafana stack is running..."
-          
+
           oc get pods -n ${{ github.event.inputs.monitoring_namespace }} | grep -E "grafana|loki|promtail" || {
             echo "❌ Grafana stack not found. Run 'Deploy Grafana Stack' workflow first."
             exit 1
           }
-          
+
           echo "✅ Grafana stack is running"
 
       - name: Add Logging Annotations to Deployments
         run: |
           echo "📝 Adding logging annotations to microservices..."
-          
+
           oc project ${{ github.event.inputs.app_namespace }}
-          
+
           for SERVICE in ${{ env.SERVICES }}; do
             echo ""
             echo "Configuring $SERVICE..."
@@ -95,7 +95,7 @@ jobs:
       - name: Create Logging ConfigMap
         run: |
           echo "📄 Creating logging configuration..."
-          
+
           cat <<EOF | oc apply -n ${{ github.event.inputs.app_namespace }} -f -
           apiVersion: v1
           kind: ConfigMap
@@ -134,13 +134,13 @@ jobs:
               # Structured JSON logging format
               # Fields: timestamp, level, message, service, traceId, spanId, exception
           EOF
-          
+
           echo "✅ Logging ConfigMap created"
 
       - name: Update Promtail to Scrape App Namespace
         run: |
           echo "🔄 Updating Promtail configuration..."
-          
+
           # Create additional scrape config for the app namespace
           cat <<EOF | oc apply -n ${{ github.event.inputs.monitoring_namespace }} -f -
           apiVersion: v1
@@ -190,30 +190,30 @@ jobs:
                     replacement: /var/log/pods/*\$1/*.log
                     target_label: __path__
           EOF
-          
+
           echo "✅ Promtail config updated"
 
       - name: Restart Promtail to Apply Config
         run: |
           echo "🔄 Restarting Promtail..."
-          
+
           oc rollout restart daemonset/promtail \
             -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || \
           oc rollout restart deployment/promtail \
             -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
-          
+
           echo "✅ Promtail restarted"
 
       - name: Verify Logs are Being Collected
         run: |
           echo "🔍 Verifying log collection..."
-          
+
           # Wait for promtail to restart
           sleep 30
-          
+
           # Get Loki service
           LOKI_SVC=$(oc get svc -n ${{ github.event.inputs.monitoring_namespace }} | grep loki | head -1 | awk '{print $1}')
-          
+
           if [ -n "$LOKI_SVC" ]; then
             echo "Loki service: $LOKI_SVC"
             
@@ -222,7 +222,7 @@ jobs:
               $(oc get pod -n ${{ github.event.inputs.monitoring_namespace }} -l app.kubernetes.io/name=loki -o jsonpath='{.items[0].metadata.name}') \
               -- wget -qO- "http://localhost:3100/loki/api/v1/labels" 2>/dev/null || echo "Could not query Loki directly"
           fi
-          
+
           echo ""
           echo "✅ Log collection configured"
           echo "   View logs in Grafana → Explore → Loki"
@@ -231,10 +231,10 @@ jobs:
         run: |
           echo "📋 Configured services:"
           echo ""
-          
+
           oc get deployments -n ${{ github.event.inputs.app_namespace }} \
             -o custom-columns=NAME:.metadata.name,LOGGING:.spec.template.metadata.labels.logging,APP:.spec.template.metadata.labels.app
-          
+
           echo ""
           echo "Pod annotations:"
           for SERVICE in ${{ env.SERVICES }}; do

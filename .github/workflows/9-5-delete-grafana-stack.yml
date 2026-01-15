@@ -1,4 +1,4 @@
-name: Delete Grafana Stack
+name: 9.5 Delete Grafana Stack
 
 # ============================================================
 # Deletes Grafana observability stack from OpenShift
@@ -8,14 +8,14 @@ on:
   workflow_dispatch:
     inputs:
       monitoring_namespace:
-        description: 'Namespace where Grafana stack is deployed'
+        description: "Namespace where Grafana stack is deployed"
         required: true
-        default: 'monitoring'
+        default: "monitoring"
       confirm_namespace:
-        description: 'Type namespace name again to confirm'
+        description: "Type namespace name again to confirm"
         required: true
       delete_pvcs:
-        description: 'Also delete Persistent Volume Claims (data loss!)'
+        description: "Also delete Persistent Volume Claims (data loss!)"
         required: true
         default: false
         type: boolean

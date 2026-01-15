@@ -1,4 +1,4 @@
-name: Create Grafana Dashboards
+name: 9.3 Create Grafana Dashboards
 
 # ============================================================
 # Creates Grafana dashboards for mortgage microservices:
@@ -12,13 +12,13 @@ on:
   workflow_dispatch:
     inputs:
       monitoring_namespace:
-        description: 'Namespace where Grafana is deployed'
+        description: "Namespace where Grafana is deployed"
         required: true
-        default: 'monitoring'
+        default: "monitoring"
       app_namespace:
-        description: 'Namespace where microservices are deployed'
+        description: "Namespace where microservices are deployed"
         required: true
-        default: 'mortgage-app'
+        default: "mortgage-app"
 
 jobs:
   create-dashboards:
@@ -42,23 +42,23 @@ jobs:
         id: grafana
         run: |
           echo "🔍 Getting Grafana credentials..."
-          
+
           GRAFANA_URL=$(oc get route grafana -n ${{ github.event.inputs.monitoring_namespace }} -o jsonpath='{.spec.host}')
           GRAFANA_PASSWORD=$(oc get secret grafana-admin-credentials -n ${{ github.event.inputs.monitoring_namespace }} -o jsonpath='{.data.admin-password}' | base64 -d)
-          
+
           echo "url=https://${GRAFANA_URL}" >> $GITHUB_OUTPUT
           echo "password=${GRAFANA_PASSWORD}" >> $GITHUB_OUTPUT
-          
+
           echo "✅ Grafana URL: https://${GRAFANA_URL}"
 
       - name: Create Mortgage Services Overview Dashboard
         run: |
           echo "📊 Creating Services Overview Dashboard..."
-          
+
           GRAFANA_URL="${{ steps.grafana.outputs.url }}"
           GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
           APP_NS="${{ github.event.inputs.app_namespace }}"
-          
+
           cat <<'EOF' > /tmp/dashboard-overview.json
           {
             "dashboard": {
@@ -178,10 +178,10 @@ jobs:
             "overwrite": true
           }
           EOF
-          
+
           # Replace placeholder with actual namespace
           sed -i "s/APP_NAMESPACE/$APP_NS/g" /tmp/dashboard-overview.json
-          
+
           # Create dashboard via API
           curl -k -X POST \
             -H "Content-Type: application/json" \
@@ -192,11 +192,11 @@ jobs:
       - name: Create Service Logs Dashboard
         run: |
           echo "📊 Creating Service Logs Dashboard..."
-          
+
           GRAFANA_URL="${{ steps.grafana.outputs.url }}"
           GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
           APP_NS="${{ github.event.inputs.app_namespace }}"
-          
+
           cat <<'EOF' > /tmp/dashboard-logs.json
           {
             "dashboard": {
@@ -278,9 +278,9 @@ jobs:
             "overwrite": true
           }
           EOF
-          
+
           sed -i "s/APP_NAMESPACE/$APP_NS/g" /tmp/dashboard-logs.json
-          
+
           curl -k -X POST \
             -H "Content-Type: application/json" \
             -u "admin:${GRAFANA_PASSWORD}" \
@@ -290,11 +290,11 @@ jobs:
       - name: Create Error Analysis Dashboard
         run: |
           echo "📊 Creating Error Analysis Dashboard..."
-          
+
           GRAFANA_URL="${{ steps.grafana.outputs.url }}"
           GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
           APP_NS="${{ github.event.inputs.app_namespace }}"
-          
+
           cat <<'EOF' > /tmp/dashboard-errors.json
           {
             "dashboard": {
@@ -477,9 +477,9 @@ jobs:
             "overwrite": true
           }
           EOF
-          
+
           sed -i "s/APP_NAMESPACE/$APP_NS/g" /tmp/dashboard-errors.json
-          
+
           curl -k -X POST \
             -H "Content-Type: application/json" \
             -u "admin:${GRAFANA_PASSWORD}" \
@@ -489,11 +489,11 @@ jobs:
       - name: Create Per-Service Dashboard Template
         run: |
           echo "📊 Creating Per-Service Dashboard..."
-          
+
           GRAFANA_URL="${{ steps.grafana.outputs.url }}"
           GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
           APP_NS="${{ github.event.inputs.app_namespace }}"
-          
+
           cat <<'EOF' > /tmp/dashboard-service.json
           {
             "dashboard": {
@@ -615,9 +615,9 @@ jobs:
             "overwrite": true
           }
           EOF
-          
+
           sed -i "s/APP_NAMESPACE/$APP_NS/g" /tmp/dashboard-service.json
-          
+
           curl -k -X POST \
             -H "Content-Type: application/json" \
             -u "admin:${GRAFANA_PASSWORD}" \
@@ -627,10 +627,10 @@ jobs:
       - name: Create Dashboard Folder
         run: |
           echo "📁 Creating dashboard folder..."
-          
+
           GRAFANA_URL="${{ steps.grafana.outputs.url }}"
           GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
-          
+
           curl -k -X POST \
             -H "Content-Type: application/json" \
             -u "admin:${GRAFANA_PASSWORD}" \
@@ -640,17 +640,17 @@ jobs:
       - name: List Created Dashboards
         run: |
           echo "📋 Listing dashboards..."
-          
+
           GRAFANA_URL="${{ steps.grafana.outputs.url }}"
           GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
-          
+
           curl -k -s -u "admin:${GRAFANA_PASSWORD}" \
             "${GRAFANA_URL}/api/search?type=dash-db" | jq -r '.[] | "\(.title) - \(.url)"'
 
       - name: Summary
         run: |
           GRAFANA_URL="${{ steps.grafana.outputs.url }}"
-          
+
           echo "## 🎉 Grafana Dashboards Created" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Dashboards" >> $GITHUB_STEP_SUMMARY
