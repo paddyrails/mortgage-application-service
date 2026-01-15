@@ -1,0 +1,559 @@
+name: 9.3 Create Grafana Dashboards
+
+# ============================================================
+# Creates Grafana dashboards for mortgage microservices:
+# - Service Overview Dashboard
+# - Logs Dashboard
+# - Error Analysis Dashboard
+# - Per-Service Dashboards
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      monitoring_namespace:
+        description: "Namespace where Grafana is deployed"
+        required: true
+        default: "monitoring"
+      app_namespace:
+        description: "Namespace where microservices are deployed"
+        required: true
+        default: "mortgage-app"
+
+jobs:
+  create-dashboards:
+    name: Create Grafana Dashboards
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install OpenShift CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xvf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+
+      - name: Login to OpenShift
+        run: |
+          oc login ${{ secrets.OPENSHIFT_SERVER }} \
+            --token=${{ secrets.OPENSHIFT_TOKEN }} \
+            --insecure-skip-tls-verify=true
+
+      - name: Get Grafana Credentials
+        id: grafana
+        run: |
+          echo "🔍 Getting Grafana credentials..."
+
+          GRAFANA_URL=$(oc get route grafana -n ${{ github.event.inputs.monitoring_namespace }} -o jsonpath='{.spec.host}')
+
+          # Try both secret names (grafana-admin for new deployment, grafana-admin-credentials for old)
+          GRAFANA_PASSWORD=$(oc get secret grafana-admin -n ${{ github.event.inputs.monitoring_namespace }} -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d) || \
+          GRAFANA_PASSWORD=$(oc get secret grafana-admin-credentials -n ${{ github.event.inputs.monitoring_namespace }} -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d) || \
+          GRAFANA_PASSWORD=""
+
+          if [ -z "$GRAFANA_PASSWORD" ]; then
+            echo "❌ Could not get Grafana password. Available secrets:"
+            oc get secrets -n ${{ github.event.inputs.monitoring_namespace }}
+            exit 1
+          fi
+
+          echo "url=https://${GRAFANA_URL}" >> $GITHUB_OUTPUT
+          echo "password=${GRAFANA_PASSWORD}" >> $GITHUB_OUTPUT
+
+          echo "✅ Grafana URL: https://${GRAFANA_URL}"
+
+      - name: Test Grafana Connection
+        run: |
+          echo "🧪 Testing Grafana API..."
+
+          RESPONSE=$(curl -k -s -o /dev/null -w "%{http_code}" \
+            -u "admin:${{ steps.grafana.outputs.password }}" \
+            "${{ steps.grafana.outputs.url }}/api/health")
+
+          if [ "$RESPONSE" = "200" ]; then
+            echo "✅ Grafana API accessible"
+          else
+            echo "❌ Grafana API returned: $RESPONSE"
+            exit 1
+          fi
+
+      - name: Get Loki Datasource UID
+        id: datasource
+        run: |
+          echo "🔍 Getting Loki datasource UID..."
+
+          # Get datasources
+          DS_RESPONSE=$(curl -k -s \
+            -u "admin:${{ steps.grafana.outputs.password }}" \
+            "${{ steps.grafana.outputs.url }}/api/datasources")
+
+          echo "Datasources: $DS_RESPONSE"
+
+          # Extract Loki UID (default to "loki" if not found)
+          LOKI_UID=$(echo "$DS_RESPONSE" | jq -r '.[] | select(.type=="loki") | .uid' 2>/dev/null | head -1)
+
+          if [ -z "$LOKI_UID" ] || [ "$LOKI_UID" = "null" ]; then
+            LOKI_UID="loki"
+            echo "Using default Loki UID: $LOKI_UID"
+          else
+            echo "Found Loki UID: $LOKI_UID"
+          fi
+
+          echo "uid=$LOKI_UID" >> $GITHUB_OUTPUT
+
+      - name: Create Mortgage Services Overview Dashboard
+        run: |
+          echo "📊 Creating Services Overview Dashboard..."
+
+          GRAFANA_URL="${{ steps.grafana.outputs.url }}"
+          GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
+          APP_NS="${{ github.event.inputs.app_namespace }}"
+          LOKI_UID="${{ steps.datasource.outputs.uid }}"
+
+          cat <<EOF > /tmp/dashboard-overview.json
+          {
+            "dashboard": {
+              "id": null,
+              "uid": "mortgage-overview",
+              "title": "Mortgage Services - Overview",
+              "tags": ["mortgage", "overview"],
+              "timezone": "browser",
+              "schemaVersion": 38,
+              "version": 1,
+              "refresh": "30s",
+              "panels": [
+                {
+                  "id": 1,
+                  "title": "Service Log Volume",
+                  "type": "timeseries",
+                  "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "sum by (app) (count_over_time({namespace=\"${APP_NS}\"}[1m]))",
+                      "legendFormat": "{{app}}",
+                      "refId": "A"
+                    }
+                  ],
+                  "fieldConfig": {
+                    "defaults": {
+                      "custom": {"lineWidth": 2, "fillOpacity": 10}
+                    }
+                  }
+                },
+                {
+                  "id": 2,
+                  "title": "Error Rate by Service",
+                  "type": "timeseries",
+                  "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "sum by (app) (count_over_time({namespace=\"${APP_NS}\"} |~ \"(?i)error|exception|fail\" [1m]))",
+                      "legendFormat": "{{app}}",
+                      "refId": "A"
+                    }
+                  ],
+                  "fieldConfig": {
+                    "defaults": {
+                      "color": {"mode": "palette-classic"},
+                      "custom": {"lineWidth": 2, "fillOpacity": 10}
+                    }
+                  }
+                },
+                {
+                  "id": 3,
+                  "title": "Recent Errors",
+                  "type": "logs",
+                  "gridPos": {"h": 10, "w": 24, "x": 0, "y": 8},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "{namespace=\"${APP_NS}\"} |~ \"(?i)error|exception|fail\"",
+                      "refId": "A"
+                    }
+                  ],
+                  "options": {
+                    "showTime": true,
+                    "showLabels": true,
+                    "wrapLogMessage": true,
+                    "enableLogDetails": true,
+                    "sortOrder": "Descending"
+                  }
+                },
+                {
+                  "id": 4,
+                  "title": "Logs per Service (5m)",
+                  "type": "stat",
+                  "gridPos": {"h": 8, "w": 24, "x": 0, "y": 18},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "sum by (app) (count_over_time({namespace=\"${APP_NS}\"}[5m]))",
+                      "legendFormat": "{{app}}",
+                      "refId": "A"
+                    }
+                  ],
+                  "options": {
+                    "reduceOptions": {"calcs": ["lastNotNull"]},
+                    "orientation": "horizontal",
+                    "colorMode": "value",
+                    "graphMode": "area"
+                  }
+                }
+              ]
+            },
+            "overwrite": true
+          }
+          EOF
+
+          RESULT=$(curl -k -s -X POST \
+            -H "Content-Type: application/json" \
+            -u "admin:${GRAFANA_PASSWORD}" \
+            -d @/tmp/dashboard-overview.json \
+            "${GRAFANA_URL}/api/dashboards/db")
+
+          echo "Response: $RESULT"
+
+          if echo "$RESULT" | grep -q '"status":"success"'; then
+            echo "✅ Overview dashboard created"
+          else
+            echo "⚠️ Dashboard creation response: $RESULT"
+          fi
+
+      - name: Create Service Logs Dashboard
+        run: |
+          echo "📊 Creating Service Logs Dashboard..."
+
+          GRAFANA_URL="${{ steps.grafana.outputs.url }}"
+          GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
+          APP_NS="${{ github.event.inputs.app_namespace }}"
+          LOKI_UID="${{ steps.datasource.outputs.uid }}"
+
+          cat <<EOF > /tmp/dashboard-logs.json
+          {
+            "dashboard": {
+              "id": null,
+              "uid": "mortgage-logs",
+              "title": "Mortgage Services - Logs",
+              "tags": ["mortgage", "logs"],
+              "timezone": "browser",
+              "schemaVersion": 38,
+              "version": 1,
+              "refresh": "10s",
+              "templating": {
+                "list": [
+                  {
+                    "name": "service",
+                    "type": "custom",
+                    "query": "customer-service,property-service,loans-service,payments-service,application-service",
+                    "includeAll": true,
+                    "multi": true,
+                    "current": {"selected": true, "text": "All", "value": "\$__all"}
+                  },
+                  {
+                    "name": "search",
+                    "type": "textbox",
+                    "current": {"text": "", "value": ""}
+                  }
+                ]
+              },
+              "panels": [
+                {
+                  "id": 1,
+                  "title": "Live Logs",
+                  "type": "logs",
+                  "gridPos": {"h": 20, "w": 24, "x": 0, "y": 0},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "{namespace=\"${APP_NS}\"} |~ \"\$search\"",
+                      "refId": "A"
+                    }
+                  ],
+                  "options": {
+                    "showTime": true,
+                    "showLabels": true,
+                    "wrapLogMessage": true,
+                    "prettifyLogMessage": true,
+                    "enableLogDetails": true,
+                    "sortOrder": "Descending"
+                  }
+                },
+                {
+                  "id": 2,
+                  "title": "Log Rate",
+                  "type": "timeseries",
+                  "gridPos": {"h": 8, "w": 24, "x": 0, "y": 20},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "sum(count_over_time({namespace=\"${APP_NS}\"}[1m]))",
+                      "legendFormat": "Logs/min",
+                      "refId": "A"
+                    }
+                  ]
+                }
+              ]
+            },
+            "overwrite": true
+          }
+          EOF
+
+          RESULT=$(curl -k -s -X POST \
+            -H "Content-Type: application/json" \
+            -u "admin:${GRAFANA_PASSWORD}" \
+            -d @/tmp/dashboard-logs.json \
+            "${GRAFANA_URL}/api/dashboards/db")
+
+          if echo "$RESULT" | grep -q '"status":"success"'; then
+            echo "✅ Logs dashboard created"
+          else
+            echo "⚠️ Response: $RESULT"
+          fi
+
+      - name: Create Error Analysis Dashboard
+        run: |
+          echo "📊 Creating Error Analysis Dashboard..."
+
+          GRAFANA_URL="${{ steps.grafana.outputs.url }}"
+          GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
+          APP_NS="${{ github.event.inputs.app_namespace }}"
+          LOKI_UID="${{ steps.datasource.outputs.uid }}"
+
+          cat <<EOF > /tmp/dashboard-errors.json
+          {
+            "dashboard": {
+              "id": null,
+              "uid": "mortgage-errors",
+              "title": "Mortgage Services - Error Analysis",
+              "tags": ["mortgage", "errors"],
+              "timezone": "browser",
+              "schemaVersion": 38,
+              "version": 1,
+              "refresh": "30s",
+              "panels": [
+                {
+                  "id": 1,
+                  "title": "Error Count (Last Hour)",
+                  "type": "stat",
+                  "gridPos": {"h": 4, "w": 8, "x": 0, "y": 0},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "sum(count_over_time({namespace=\"${APP_NS}\"} |~ \"(?i)error|exception\" [1h]))",
+                      "refId": "A"
+                    }
+                  ],
+                  "options": {"colorMode": "value", "graphMode": "none"},
+                  "fieldConfig": {
+                    "defaults": {
+                      "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                          {"color": "green", "value": null},
+                          {"color": "yellow", "value": 10},
+                          {"color": "red", "value": 50}
+                        ]
+                      }
+                    }
+                  }
+                },
+                {
+                  "id": 2,
+                  "title": "Warning Count (Last Hour)",
+                  "type": "stat",
+                  "gridPos": {"h": 4, "w": 8, "x": 8, "y": 0},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "sum(count_over_time({namespace=\"${APP_NS}\"} |~ \"(?i)warn\" [1h]))",
+                      "refId": "A"
+                    }
+                  ],
+                  "options": {"colorMode": "value", "graphMode": "none"},
+                  "fieldConfig": {
+                    "defaults": {
+                      "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                          {"color": "green", "value": null},
+                          {"color": "yellow", "value": 50},
+                          {"color": "orange", "value": 100}
+                        ]
+                      }
+                    }
+                  }
+                },
+                {
+                  "id": 3,
+                  "title": "Total Logs (Last Hour)",
+                  "type": "stat",
+                  "gridPos": {"h": 4, "w": 8, "x": 16, "y": 0},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "sum(count_over_time({namespace=\"${APP_NS}\"}[1h]))",
+                      "refId": "A"
+                    }
+                  ],
+                  "options": {"colorMode": "value", "graphMode": "none"}
+                },
+                {
+                  "id": 4,
+                  "title": "Error Trend (24h)",
+                  "type": "timeseries",
+                  "gridPos": {"h": 8, "w": 24, "x": 0, "y": 4},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "sum by (app) (count_over_time({namespace=\"${APP_NS}\"} |~ \"(?i)error|exception\" [5m]))",
+                      "legendFormat": "{{app}}",
+                      "refId": "A"
+                    }
+                  ],
+                  "fieldConfig": {
+                    "defaults": {
+                      "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 20}
+                    }
+                  }
+                },
+                {
+                  "id": 5,
+                  "title": "Recent Errors",
+                  "type": "logs",
+                  "gridPos": {"h": 12, "w": 24, "x": 0, "y": 12},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "{namespace=\"${APP_NS}\"} |~ \"(?i)error|exception|fail\"",
+                      "refId": "A"
+                    }
+                  ],
+                  "options": {
+                    "showTime": true,
+                    "showLabels": true,
+                    "wrapLogMessage": true,
+                    "enableLogDetails": true,
+                    "sortOrder": "Descending"
+                  }
+                }
+              ]
+            },
+            "overwrite": true
+          }
+          EOF
+
+          RESULT=$(curl -k -s -X POST \
+            -H "Content-Type: application/json" \
+            -u "admin:${GRAFANA_PASSWORD}" \
+            -d @/tmp/dashboard-errors.json \
+            "${GRAFANA_URL}/api/dashboards/db")
+
+          if echo "$RESULT" | grep -q '"status":"success"'; then
+            echo "✅ Error Analysis dashboard created"
+          else
+            echo "⚠️ Response: $RESULT"
+          fi
+
+      - name: Create Monitoring Dashboard (for monitoring namespace)
+        run: |
+          echo "📊 Creating Monitoring Dashboard..."
+
+          GRAFANA_URL="${{ steps.grafana.outputs.url }}"
+          GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
+          MON_NS="${{ github.event.inputs.monitoring_namespace }}"
+          LOKI_UID="${{ steps.datasource.outputs.uid }}"
+
+          cat <<EOF > /tmp/dashboard-monitoring.json
+          {
+            "dashboard": {
+              "id": null,
+              "uid": "monitoring-logs",
+              "title": "Monitoring Stack - Logs",
+              "tags": ["monitoring", "logs"],
+              "timezone": "browser",
+              "schemaVersion": 38,
+              "version": 1,
+              "refresh": "10s",
+              "panels": [
+                {
+                  "id": 1,
+                  "title": "All Logs",
+                  "type": "logs",
+                  "gridPos": {"h": 20, "w": 24, "x": 0, "y": 0},
+                  "datasource": {"type": "loki", "uid": "${LOKI_UID}"},
+                  "targets": [
+                    {
+                      "expr": "{namespace=\"${MON_NS}\"}",
+                      "refId": "A"
+                    }
+                  ],
+                  "options": {
+                    "showTime": true,
+                    "showLabels": true,
+                    "wrapLogMessage": true,
+                    "enableLogDetails": true,
+                    "sortOrder": "Descending"
+                  }
+                }
+              ]
+            },
+            "overwrite": true
+          }
+          EOF
+
+          RESULT=$(curl -k -s -X POST \
+            -H "Content-Type: application/json" \
+            -u "admin:${GRAFANA_PASSWORD}" \
+            -d @/tmp/dashboard-monitoring.json \
+            "${GRAFANA_URL}/api/dashboards/db")
+
+          if echo "$RESULT" | grep -q '"status":"success"'; then
+            echo "✅ Monitoring dashboard created"
+          else
+            echo "⚠️ Response: $RESULT"
+          fi
+
+      - name: List Created Dashboards
+        run: |
+          echo "📋 Listing dashboards..."
+
+          GRAFANA_URL="${{ steps.grafana.outputs.url }}"
+          GRAFANA_PASSWORD="${{ steps.grafana.outputs.password }}"
+
+          RESPONSE=$(curl -k -s -u "admin:${GRAFANA_PASSWORD}" \
+            "${GRAFANA_URL}/api/search?type=dash-db")
+
+          echo "Raw response: $RESPONSE"
+          echo ""
+          echo "Dashboards:"
+          echo "$RESPONSE" | jq -r '.[] | "  - \(.title): \(.url)"' 2>/dev/null || echo "Could not parse dashboards"
+
+      - name: Summary
+        run: |
+          GRAFANA_URL="${{ steps.grafana.outputs.url }}"
+
+          echo "## 🎉 Grafana Dashboards Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Dashboards" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Dashboard | Description |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| [Services Overview](${GRAFANA_URL}/d/mortgage-overview) | High-level view of all services |" >> $GITHUB_STEP_SUMMARY
+          echo "| [Logs](${GRAFANA_URL}/d/mortgage-logs) | Live log viewer with filters |" >> $GITHUB_STEP_SUMMARY
+          echo "| [Error Analysis](${GRAFANA_URL}/d/mortgage-errors) | Error tracking and trends |" >> $GITHUB_STEP_SUMMARY
+          echo "| [Monitoring Stack](${GRAFANA_URL}/d/monitoring-logs) | Logs from monitoring namespace |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Access" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL**: ${GRAFANA_URL}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Username**: admin" >> $GITHUB_STEP_SUMMARY
+
+          echo ""
+          echo "════════════════════════════════════════════"
+          echo "  DASHBOARDS CREATED"
+          echo "════════════════════════════════════════════"
+          echo "  ${GRAFANA_URL}/d/mortgage-overview"
+          echo "  ${GRAFANA_URL}/d/mortgage-logs"
+          echo "  ${GRAFANA_URL}/d/mortgage-errors"
+          echo "  ${GRAFANA_URL}/d/monitoring-logs"
+          echo "════════════════════════════════════════════"
