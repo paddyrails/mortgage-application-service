@@ -1,4 +1,4 @@
-name: Delete Grafana Stack
+name: 9.5 Delete Grafana Stack
 
 # ============================================================
 # Deletes Grafana observability stack from OpenShift:
@@ -12,19 +12,19 @@ on:
   workflow_dispatch:
     inputs:
       monitoring_namespace:
-        description: 'Namespace where Grafana stack is deployed'
+        description: "Namespace where Grafana stack is deployed"
         required: true
-        default: 'monitoring'
+        default: "monitoring"
       confirm_namespace:
-        description: 'Type namespace name again to confirm deletion'
+        description: "Type namespace name again to confirm deletion"
         required: true
       delete_pvcs:
-        description: 'Also delete Persistent Volume Claims (data will be lost!)'
+        description: "Also delete Persistent Volume Claims (data will be lost!)"
         required: true
         default: false
         type: boolean
       delete_namespace:
-        description: 'Delete the entire namespace'
+        description: "Delete the entire namespace"
         required: true
         default: false
         type: boolean
@@ -82,26 +82,26 @@ jobs:
       - name: Delete Loki (YAML Deployment)
         run: |
           echo "🗑️ Deleting Loki..."
-          
+
           # Delete Loki deployment
           oc delete deployment loki -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Loki deployment deleted" || echo "⚠️ Loki deployment not found"
-          
+
           # Delete Loki service
           oc delete service loki -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Loki service deleted" || echo "⚠️ Loki service not found"
-          
+
           # Delete Loki configmap
           oc delete configmap loki-config -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Loki configmap deleted" || echo "⚠️ Loki configmap not found"
 
       - name: Delete Promtail (YAML DaemonSet)
         run: |
           echo "🗑️ Deleting Promtail..."
-          
+
           # Delete Promtail daemonset
           oc delete daemonset promtail -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Promtail daemonset deleted" || echo "⚠️ Promtail daemonset not found"
-          
+
           # Delete Promtail configmap
           oc delete configmap promtail-config -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Promtail configmap deleted" || echo "⚠️ Promtail configmap not found"
-          
+
           # Delete Promtail service account
           oc delete serviceaccount promtail -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Promtail SA deleted" || echo "⚠️ Promtail SA not found"
 
@@ -113,22 +113,22 @@ jobs:
       - name: Delete Secrets and ConfigMaps
         run: |
           echo "🗑️ Deleting secrets and configmaps..."
-          
+
           oc delete secret grafana-admin-credentials -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
           oc delete configmap promtail-mortgage-config -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
-          
+
           echo "✅ Secrets and configmaps deleted"
 
       - name: Delete RBAC Resources
         run: |
           echo "🗑️ Deleting RBAC resources..."
-          
+
           # Delete ClusterRoleBinding
           oc delete clusterrolebinding promtail-clusterrolebinding 2>/dev/null && echo "✅ ClusterRoleBinding deleted" || echo "⚠️ ClusterRoleBinding not found"
-          
+
           # Delete ClusterRole
           oc delete clusterrole promtail-clusterrole 2>/dev/null && echo "✅ ClusterRole deleted" || echo "⚠️ ClusterRole not found"
-          
+
           # Remove SCC from promtail service account
           oc adm policy remove-scc-from-user privileged -z promtail -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
 
@@ -136,30 +136,30 @@ jobs:
         if: github.event.inputs.delete_pvcs == 'true'
         run: |
           echo "🗑️ Deleting PVCs (data will be permanently lost!)..."
-          
+
           # Delete Loki PVC
           oc delete pvc loki-data -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null && echo "✅ Loki PVC deleted" || echo "⚠️ Loki PVC not found"
-          
+
           # Delete any Grafana PVCs
           oc delete pvc -l app.kubernetes.io/name=grafana -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
-          
+
           # Delete any remaining PVCs
           oc delete pvc --all -n ${{ github.event.inputs.monitoring_namespace }} 2>/dev/null || true
-          
+
           echo "✅ All PVCs deleted"
 
       - name: Delete Namespace
         if: github.event.inputs.delete_namespace == 'true'
         run: |
           echo "🗑️ Deleting namespace ${{ github.event.inputs.monitoring_namespace }}..."
-          
+
           oc delete namespace ${{ github.event.inputs.monitoring_namespace }} --timeout=120s 2>/dev/null && echo "✅ Namespace deleted" || echo "⚠️ Namespace deletion may be in progress"
 
       - name: Verify Deletion
         run: |
           echo "🔍 Verifying deletion..."
           echo ""
-          
+
           if [ "${{ github.event.inputs.delete_namespace }}" == "true" ]; then
             # Check if namespace still exists
             if oc get namespace ${{ github.event.inputs.monitoring_namespace }} &>/dev/null; then
