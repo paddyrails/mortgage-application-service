@@ -26,6 +26,7 @@ on:
         default: "m5.xlarge"
         type: choice
         options:
+          - "t3.xlarge"
           - "m5.large"
           - "m5.xlarge"
           - "m5.2xlarge"
