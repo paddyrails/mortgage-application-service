@@ -1,0 +1,158 @@
+name: Start Cluster (Scale to One)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster name'
+        required: true
+        default: 'mortgage-test'
+      use_spot:
+        description: 'Use Spot Instance (cheaper)'
+        required: true
+        default: true
+        type: boolean
+      instance_type:
+        description: 'Instance type'
+        required: true
+        default: 'm5.xlarge'
+        type: choice
+        options:
+          - m5.large
+          - m5.xlarge
+          - m5.2xlarge
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  start-cluster:
+    name: Start Cluster
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install ROSA CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xvf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+
+      - name: Login to ROSA
+        run: |
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+
+      - name: Show current state
+        run: |
+          echo "📊 Current machine pools:"
+          rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
+
+      - name: Scale workers to 1
+        run: |
+          echo "▶️ Starting cluster with 1 worker..."
+          
+          if [ "${{ github.event.inputs.use_spot }}" == "true" ]; then
+            POOL_NAME="spot-worker"
+            
+            # Check if spot-worker pool exists
+            POOL_EXISTS=$(rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.[] | select(.id=="spot-worker") | .id' 2>/dev/null || echo "")
+            
+            if [ -n "$POOL_EXISTS" ]; then
+              echo "Scaling existing spot-worker pool to 1..."
+              rosa edit machinepool \
+                --cluster=${{ github.event.inputs.cluster_name }} \
+                --replicas=1 \
+                spot-worker
+            else
+              echo "Creating new spot-worker pool..."
+              rosa create machinepool \
+                --cluster=${{ github.event.inputs.cluster_name }} \
+                --name=spot-worker \
+                --instance-type=${{ github.event.inputs.instance_type }} \
+                --replicas=1 \
+                --use-spot-instances \
+                --labels=node-type=spot,workload=mortgage-app
+            fi
+            
+            # Ensure default workers pool stays at 0
+            rosa edit machinepool \
+              --cluster=${{ github.event.inputs.cluster_name }} \
+              --replicas=0 \
+              workers 2>/dev/null || true
+              
+          else
+            POOL_NAME="workers"
+            
+            # Check if workers pool exists
+            POOL_EXISTS=$(rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.[] | select(.id=="workers") | .id' 2>/dev/null || echo "")
+            
+            if [ -n "$POOL_EXISTS" ]; then
+              echo "Scaling existing workers pool to 1..."
+              rosa edit machinepool \
+                --cluster=${{ github.event.inputs.cluster_name }} \
+                --replicas=1 \
+                workers
+            else
+              echo "Creating new workers pool..."
+              rosa create machinepool \
+                --cluster=${{ github.event.inputs.cluster_name }} \
+                --name=workers \
+                --instance-type=${{ github.event.inputs.instance_type }} \
+                --replicas=1 \
+                --labels=node-type=on-demand,workload=mortgage-app
+            fi
+            
+            # Ensure spot-worker pool stays at 0
+            rosa edit machinepool \
+              --cluster=${{ github.event.inputs.cluster_name }} \
+              --replicas=0 \
+              spot-worker 2>/dev/null || true
+          fi
+          
+          echo ""
+          echo "⏳ Waiting for worker node to be ready..."
+
+      - name: Wait for worker node
+        run: |
+          echo "⏳ Waiting for worker to become ready (up to 5 minutes)..."
+          
+          for i in {1..10}; do
+            READY=$(rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }} -o json | jq -r '.[] | select(.replicas > 0) | .status.current_replicas // 0' 2>/dev/null | head -1 || echo "0")
+            
+            if [ "$READY" == "1" ]; then
+              echo "✅ Worker node is ready!"
+              break
+            fi
+            
+            echo "  Waiting... ($i/10)"
+            sleep 30
+          done
+
+      - name: Verify
+        run: |
+          echo "📊 Final state:"
+          rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
+
+      - name: Summary
+        run: |
+          if [ "${{ github.event.inputs.use_spot }}" == "true" ]; then
+            WORKER_COST="~\$45"
+          else
+            WORKER_COST="~\$140"
+          fi
+          
+          echo "## ▶️ Cluster Started" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Workers | 1 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Instance Type | ${{ github.event.inputs.instance_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Spot Instance | ${{ github.event.inputs.use_spot }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 💰 Cost While Running" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Cost |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Control Plane | ~\$30/month |" >> $GITHUB_STEP_SUMMARY
+          echo "| Worker (1x ${{ github.event.inputs.instance_type }}) | ${WORKER_COST}/month |" >> $GITHUB_STEP_SUMMARY
+          echo "| NAT Gateway | ~\$32/month |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Cluster is ready to accept workloads!" >> $GITHUB_STEP_SUMMARY

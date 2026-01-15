@@ -1,0 +1,73 @@
+name: Stop Cluster (Scale to Zero)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster name'
+        required: true
+        default: 'mortgage-test'
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  stop-cluster:
+    name: Stop Cluster
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install ROSA CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+          tar -xvf rosa-linux.tar.gz
+          sudo mv rosa /usr/local/bin/
+
+      - name: Login to ROSA
+        run: |
+          rosa login --token=${{ secrets.ROSA_TOKEN }}
+
+      - name: Show current state
+        run: |
+          echo "📊 Current machine pools:"
+          rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
+
+      - name: Scale all workers to zero
+        run: |
+          echo "⏹️ Scaling all workers to 0..."
+          
+          # Scale spot-worker pool to 0
+          rosa edit machinepool \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --replicas=0 \
+            spot-worker 2>/dev/null || echo "spot-worker pool not found"
+          
+          # Scale default workers pool to 0
+          rosa edit machinepool \
+            --cluster=${{ github.event.inputs.cluster_name }} \
+            --replicas=0 \
+            workers 2>/dev/null || echo "workers pool not found"
+          
+          echo ""
+          echo "✅ All workers scaled to 0"
+
+      - name: Verify
+        run: |
+          echo "📊 Final state:"
+          rosa list machinepools --cluster=${{ github.event.inputs.cluster_name }}
+
+      - name: Summary
+        run: |
+          echo "## ⏹️ Cluster Stopped" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All workers scaled to 0." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 💰 Cost While Stopped" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Cost |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Control Plane | ~\$30/month |" >> $GITHUB_STEP_SUMMARY
+          echo "| Workers | **\$0** |" >> $GITHUB_STEP_SUMMARY
+          echo "| NAT Gateway | ~\$32/month |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Total** | **~\$62/month** |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Run **Start Cluster** workflow to scale back up." >> $GITHUB_STEP_SUMMARY
