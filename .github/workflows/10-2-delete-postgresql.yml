@@ -1,0 +1,86 @@
+name: Delete PostgreSQL Database
+
+# ============================================================
+# Deletes PostgreSQL and all related resources
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: 'Namespace where PostgreSQL is deployed'
+        required: true
+        default: 'mortgage-app'
+      confirm_delete:
+        description: 'Type "DELETE" to confirm (data will be lost!)'
+        required: true
+      delete_pvc:
+        description: 'Delete PVC (permanent data loss!)'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  delete-postgresql:
+    name: Delete PostgreSQL
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate Confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_delete }}" != "DELETE" ]; then
+            echo "❌ You must type DELETE to confirm"
+            exit 1
+          fi
+          echo "✅ Deletion confirmed"
+
+      - name: Install OpenShift CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xvf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+
+      - name: Login to OpenShift
+        run: |
+          oc login ${{ secrets.OPENSHIFT_SERVER }} \
+            --token=${{ secrets.OPENSHIFT_TOKEN }} \
+            --insecure-skip-tls-verify=true
+
+      - name: Delete PostgreSQL Resources
+        run: |
+          echo "🗑️ Deleting PostgreSQL..."
+          
+          oc delete deployment postgresql -n ${{ github.event.inputs.namespace }} 2>/dev/null && echo "✅ Deployment deleted" || echo "⚠️ Deployment not found"
+          oc delete service postgresql -n ${{ github.event.inputs.namespace }} 2>/dev/null && echo "✅ Service deleted" || echo "⚠️ Service not found"
+          oc delete configmap postgresql-init -n ${{ github.event.inputs.namespace }} 2>/dev/null && echo "✅ ConfigMap deleted" || echo "⚠️ ConfigMap not found"
+          
+          # Delete secrets
+          oc delete secret postgresql-admin -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
+          for SERVICE in customer property loans payments application; do
+            oc delete secret postgresql-${SERVICE}-service -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
+          done
+          echo "✅ Secrets deleted"
+          
+          # Delete service account
+          oc delete serviceaccount postgresql -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
+
+      - name: Delete PVC
+        if: github.event.inputs.delete_pvc == 'true'
+        run: |
+          echo "🗑️ Deleting PVC (data will be permanently lost!)..."
+          oc delete pvc postgresql-data -n ${{ github.event.inputs.namespace }} 2>/dev/null && echo "✅ PVC deleted" || echo "⚠️ PVC not found"
+
+      - name: Summary
+        run: |
+          echo "## 🗑️ PostgreSQL Deleted" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Resources deleted from namespace \`${{ github.event.inputs.namespace }}\`:" >> $GITHUB_STEP_SUMMARY
+          echo "- Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "- Service" >> $GITHUB_STEP_SUMMARY
+          echo "- ConfigMap" >> $GITHUB_STEP_SUMMARY
+          echo "- Secrets (admin + 5 service secrets)" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.delete_pvc }}" == "true" ]; then
+            echo "- PVC (data permanently deleted)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- PVC preserved (data retained)" >> $GITHUB_STEP_SUMMARY
+          fi

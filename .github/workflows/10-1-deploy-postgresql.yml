@@ -1,0 +1,501 @@
+name: Deploy PostgreSQL Database
+
+# ============================================================
+# Deploys PostgreSQL on OpenShift with separate schemas for
+# each mortgage microservice:
+# - customer_service schema
+# - property_service schema
+# - loans_service schema
+# - payments_service schema
+# - application_service schema
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: 'Namespace for PostgreSQL'
+        required: true
+        default: 'mortgage-app'
+      postgres_password:
+        description: 'PostgreSQL admin password (leave empty to auto-generate)'
+        required: false
+        default: ''
+      storage_size:
+        description: 'Storage size for PostgreSQL'
+        required: true
+        default: '10Gi'
+        type: choice
+        options:
+          - '5Gi'
+          - '10Gi'
+          - '20Gi'
+          - '50Gi'
+      postgres_version:
+        description: 'PostgreSQL version'
+        required: true
+        default: '15'
+        type: choice
+        options:
+          - '13'
+          - '14'
+          - '15'
+          - '16'
+
+env:
+  DB_NAME: mortgage_db
+
+jobs:
+  deploy-postgresql:
+    name: Deploy PostgreSQL
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install OpenShift CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xvf openshift-client-linux.tar.gz
+          sudo mv oc kubectl /usr/local/bin/
+
+      - name: Login to OpenShift
+        run: |
+          oc login ${{ secrets.OPENSHIFT_SERVER }} \
+            --token=${{ secrets.OPENSHIFT_TOKEN }} \
+            --insecure-skip-tls-verify=true
+
+      - name: Create Namespace
+        run: |
+          oc create namespace ${{ github.event.inputs.namespace }} 2>/dev/null || echo "Namespace exists"
+          oc project ${{ github.event.inputs.namespace }}
+
+      - name: Generate Passwords
+        id: passwords
+        run: |
+          # Admin password
+          if [ -n "${{ github.event.inputs.postgres_password }}" ]; then
+            POSTGRES_PASSWORD="${{ github.event.inputs.postgres_password }}"
+          else
+            POSTGRES_PASSWORD=$(openssl rand -hex 16)
+          fi
+          
+          # Service passwords
+          CUSTOMER_PASSWORD=$(openssl rand -hex 12)
+          PROPERTY_PASSWORD=$(openssl rand -hex 12)
+          LOANS_PASSWORD=$(openssl rand -hex 12)
+          PAYMENTS_PASSWORD=$(openssl rand -hex 12)
+          APPLICATION_PASSWORD=$(openssl rand -hex 12)
+          
+          echo "postgres_password=$POSTGRES_PASSWORD" >> $GITHUB_OUTPUT
+          echo "customer_password=$CUSTOMER_PASSWORD" >> $GITHUB_OUTPUT
+          echo "property_password=$PROPERTY_PASSWORD" >> $GITHUB_OUTPUT
+          echo "loans_password=$LOANS_PASSWORD" >> $GITHUB_OUTPUT
+          echo "payments_password=$PAYMENTS_PASSWORD" >> $GITHUB_OUTPUT
+          echo "application_password=$APPLICATION_PASSWORD" >> $GITHUB_OUTPUT
+
+      - name: Create PostgreSQL Secrets
+        run: |
+          echo "🔐 Creating secrets..."
+          
+          # Main PostgreSQL admin secret
+          oc create secret generic postgresql-admin \
+            --from-literal=POSTGRES_USER=postgres \
+            --from-literal=POSTGRES_PASSWORD=${{ steps.passwords.outputs.postgres_password }} \
+            --from-literal=POSTGRES_DB=${{ env.DB_NAME }} \
+            -n ${{ github.event.inputs.namespace }} \
+            --dry-run=client -o yaml | oc apply -f -
+          
+          # Per-service secrets with connection strings
+          for SERVICE in customer property loans payments application; do
+            case $SERVICE in
+              customer) PASSWORD=${{ steps.passwords.outputs.customer_password }} ;;
+              property) PASSWORD=${{ steps.passwords.outputs.property_password }} ;;
+              loans) PASSWORD=${{ steps.passwords.outputs.loans_password }} ;;
+              payments) PASSWORD=${{ steps.passwords.outputs.payments_password }} ;;
+              application) PASSWORD=${{ steps.passwords.outputs.application_password }} ;;
+            esac
+            
+            SCHEMA="${SERVICE}_service"
+            USER="${SERVICE}_user"
+            CONN_STRING="Host=postgresql;Port=5432;Database=${{ env.DB_NAME }};Username=${USER};Password=${PASSWORD};Search Path=${SCHEMA}"
+            
+            oc create secret generic postgresql-${SERVICE}-service \
+              --from-literal=DB_HOST=postgresql \
+              --from-literal=DB_PORT=5432 \
+              --from-literal=DB_NAME=${{ env.DB_NAME }} \
+              --from-literal=DB_SCHEMA=${SCHEMA} \
+              --from-literal=DB_USER=${USER} \
+              --from-literal=DB_PASSWORD=${PASSWORD} \
+              --from-literal=CONNECTION_STRING="${CONN_STRING}" \
+              -n ${{ github.event.inputs.namespace }} \
+              --dry-run=client -o yaml | oc apply -f -
+            
+            echo "✅ Secret created for ${SERVICE}-service"
+          done
+
+      - name: Create Init Script ConfigMap
+        run: |
+          echo "📝 Creating initialization script..."
+          
+          cat <<'EOF' | oc apply -n ${{ github.event.inputs.namespace }} -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: postgresql-init
+          data:
+            init-schemas.sql: |
+              -- ============================================================
+              -- Mortgage Microservices Database Initialization
+              -- Creates separate schemas and users for each service
+              -- ============================================================
+              
+              -- Create schemas
+              CREATE SCHEMA IF NOT EXISTS customer_service;
+              CREATE SCHEMA IF NOT EXISTS property_service;
+              CREATE SCHEMA IF NOT EXISTS loans_service;
+              CREATE SCHEMA IF NOT EXISTS payments_service;
+              CREATE SCHEMA IF NOT EXISTS application_service;
+              
+              -- Create users (passwords will be set via environment variables)
+              DO $$
+              BEGIN
+                -- Customer Service User
+                IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'customer_user') THEN
+                  CREATE USER customer_user WITH PASSWORD '${CUSTOMER_PASSWORD}';
+                END IF;
+                GRANT USAGE ON SCHEMA customer_service TO customer_user;
+                GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA customer_service TO customer_user;
+                GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA customer_service TO customer_user;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA customer_service GRANT ALL ON TABLES TO customer_user;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA customer_service GRANT ALL ON SEQUENCES TO customer_user;
+                
+                -- Property Service User
+                IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'property_user') THEN
+                  CREATE USER property_user WITH PASSWORD '${PROPERTY_PASSWORD}';
+                END IF;
+                GRANT USAGE ON SCHEMA property_service TO property_user;
+                GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA property_service TO property_user;
+                GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA property_service TO property_user;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA property_service GRANT ALL ON TABLES TO property_user;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA property_service GRANT ALL ON SEQUENCES TO property_user;
+                
+                -- Loans Service User
+                IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'loans_user') THEN
+                  CREATE USER loans_user WITH PASSWORD '${LOANS_PASSWORD}';
+                END IF;
+                GRANT USAGE ON SCHEMA loans_service TO loans_user;
+                GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA loans_service TO loans_user;
+                GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA loans_service TO loans_user;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA loans_service GRANT ALL ON TABLES TO loans_user;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA loans_service GRANT ALL ON SEQUENCES TO loans_user;
+                
+                -- Payments Service User
+                IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'payments_user') THEN
+                  CREATE USER payments_user WITH PASSWORD '${PAYMENTS_PASSWORD}';
+                END IF;
+                GRANT USAGE ON SCHEMA payments_service TO payments_user;
+                GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA payments_service TO payments_user;
+                GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA payments_service TO payments_user;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA payments_service GRANT ALL ON TABLES TO payments_user;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA payments_service GRANT ALL ON SEQUENCES TO payments_user;
+                
+                -- Application Service User
+                IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'application_user') THEN
+                  CREATE USER application_user WITH PASSWORD '${APPLICATION_PASSWORD}';
+                END IF;
+                GRANT USAGE ON SCHEMA application_service TO application_user;
+                GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA application_service TO application_user;
+                GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA application_service TO application_user;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA application_service GRANT ALL ON TABLES TO application_user;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA application_service GRANT ALL ON SEQUENCES TO application_user;
+              END
+              $$;
+              
+              -- Log completion
+              DO $$ BEGIN RAISE NOTICE 'All schemas and users created successfully'; END $$;
+              
+            init-schemas.sh: |
+              #!/bin/bash
+              set -e
+              
+              echo "🚀 Initializing database schemas..."
+              
+              # Replace password placeholders in SQL
+              sed -e "s/\${CUSTOMER_PASSWORD}/${CUSTOMER_PASSWORD}/g" \
+                  -e "s/\${PROPERTY_PASSWORD}/${PROPERTY_PASSWORD}/g" \
+                  -e "s/\${LOANS_PASSWORD}/${LOANS_PASSWORD}/g" \
+                  -e "s/\${PAYMENTS_PASSWORD}/${PAYMENTS_PASSWORD}/g" \
+                  -e "s/\${APPLICATION_PASSWORD}/${APPLICATION_PASSWORD}/g" \
+                  /docker-entrypoint-initdb.d/init-schemas.sql > /tmp/init.sql
+              
+              # Run the SQL
+              psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -f /tmp/init.sql
+              
+              echo "✅ Database initialization complete"
+          EOF
+          
+          echo "✅ Init ConfigMap created"
+
+      - name: Create Service Account
+        run: |
+          oc create serviceaccount postgresql -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
+          oc adm policy add-scc-to-user anyuid -z postgresql -n ${{ github.event.inputs.namespace }} 2>/dev/null || echo "SCC may need admin"
+
+      - name: Deploy PostgreSQL
+        run: |
+          echo "📦 Deploying PostgreSQL..."
+          
+          cat <<EOF | oc apply -n ${{ github.event.inputs.namespace }} -f -
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: postgresql-data
+            labels:
+              app: postgresql
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: ${{ github.event.inputs.storage_size }}
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: postgresql
+            labels:
+              app: postgresql
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: postgresql
+            strategy:
+              type: Recreate
+            template:
+              metadata:
+                labels:
+                  app: postgresql
+              spec:
+                serviceAccountName: postgresql
+                containers:
+                  - name: postgresql
+                    image: postgres:${{ github.event.inputs.postgres_version }}
+                    ports:
+                      - containerPort: 5432
+                        name: postgres
+                    env:
+                      - name: POSTGRES_USER
+                        valueFrom:
+                          secretKeyRef:
+                            name: postgresql-admin
+                            key: POSTGRES_USER
+                      - name: POSTGRES_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: postgresql-admin
+                            key: POSTGRES_PASSWORD
+                      - name: POSTGRES_DB
+                        valueFrom:
+                          secretKeyRef:
+                            name: postgresql-admin
+                            key: POSTGRES_DB
+                      - name: PGDATA
+                        value: /var/lib/postgresql/data/pgdata
+                      # Service passwords for init script
+                      - name: CUSTOMER_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: postgresql-customer-service
+                            key: DB_PASSWORD
+                      - name: PROPERTY_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: postgresql-property-service
+                            key: DB_PASSWORD
+                      - name: LOANS_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: postgresql-loans-service
+                            key: DB_PASSWORD
+                      - name: PAYMENTS_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: postgresql-payments-service
+                            key: DB_PASSWORD
+                      - name: APPLICATION_PASSWORD
+                        valueFrom:
+                          secretKeyRef:
+                            name: postgresql-application-service
+                            key: DB_PASSWORD
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 256Mi
+                      limits:
+                        cpu: 500m
+                        memory: 512Mi
+                    volumeMounts:
+                      - name: data
+                        mountPath: /var/lib/postgresql/data
+                      - name: init
+                        mountPath: /docker-entrypoint-initdb.d
+                    readinessProbe:
+                      exec:
+                        command:
+                          - pg_isready
+                          - -U
+                          - postgres
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+                    livenessProbe:
+                      exec:
+                        command:
+                          - pg_isready
+                          - -U
+                          - postgres
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                volumes:
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: postgresql-data
+                  - name: init
+                    configMap:
+                      name: postgresql-init
+                      defaultMode: 0755
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgresql
+            labels:
+              app: postgresql
+          spec:
+            ports:
+              - port: 5432
+                targetPort: 5432
+                name: postgres
+            selector:
+              app: postgresql
+            type: ClusterIP
+          EOF
+          
+          echo "✅ PostgreSQL deployment created"
+
+      - name: Wait for PostgreSQL
+        run: |
+          echo "⏳ Waiting for PostgreSQL to be ready..."
+          
+          oc rollout status deployment/postgresql -n ${{ github.event.inputs.namespace }} --timeout=300s || {
+            echo "❌ PostgreSQL failed to start"
+            oc describe deployment postgresql -n ${{ github.event.inputs.namespace }}
+            oc logs -n ${{ github.event.inputs.namespace }} -l app=postgresql --tail=50
+            exit 1
+          }
+          
+          echo "✅ PostgreSQL is running"
+
+      - name: Run Schema Initialization
+        run: |
+          echo "🔧 Running schema initialization..."
+          
+          # Wait for postgres to be fully ready
+          sleep 10
+          
+          POD=$(oc get pod -n ${{ github.event.inputs.namespace }} -l app=postgresql -o jsonpath='{.items[0].metadata.name}')
+          
+          # Check if schemas already exist
+          SCHEMA_COUNT=$(oc exec -n ${{ github.event.inputs.namespace }} $POD -- psql -U postgres -d ${{ env.DB_NAME }} -t -c "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name LIKE '%_service';" 2>/dev/null | tr -d ' ' || echo "0")
+          
+          if [ "$SCHEMA_COUNT" -lt "5" ]; then
+            echo "Running init script..."
+            oc exec -n ${{ github.event.inputs.namespace }} $POD -- bash /docker-entrypoint-initdb.d/init-schemas.sh || {
+              echo "⚠️ Init script may have already run or failed, checking schemas..."
+            }
+          else
+            echo "Schemas already exist ($SCHEMA_COUNT found)"
+          fi
+          
+          # Verify schemas
+          echo ""
+          echo "=== Verifying Schemas ==="
+          oc exec -n ${{ github.event.inputs.namespace }} $POD -- psql -U postgres -d ${{ env.DB_NAME }} -c "\dn"
+          
+          echo ""
+          echo "=== Verifying Users ==="
+          oc exec -n ${{ github.event.inputs.namespace }} $POD -- psql -U postgres -d ${{ env.DB_NAME }} -c "\du"
+
+      - name: Test Connections
+        run: |
+          echo "🧪 Testing service connections..."
+          
+          POD=$(oc get pod -n ${{ github.event.inputs.namespace }} -l app=postgresql -o jsonpath='{.items[0].metadata.name}')
+          
+          for SERVICE in customer property loans payments application; do
+            USER="${SERVICE}_user"
+            SCHEMA="${SERVICE}_service"
+            PASSWORD=$(oc get secret postgresql-${SERVICE}-service -n ${{ github.event.inputs.namespace }} -o jsonpath='{.data.DB_PASSWORD}' | base64 -d)
+            
+            echo -n "Testing ${SERVICE}_service connection... "
+            if oc exec -n ${{ github.event.inputs.namespace }} $POD -- psql -U $USER -d ${{ env.DB_NAME }} -c "SET search_path TO ${SCHEMA}; SELECT 1;" &>/dev/null; then
+              echo "✅ OK"
+            else
+              echo "❌ FAILED"
+            fi
+          done
+
+      - name: Summary
+        run: |
+          echo "## 🐘 PostgreSQL Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Connection Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Host | \`postgresql\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Port | \`5432\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Database | \`${{ env.DB_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Admin User | \`postgres\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Admin Password | \`${{ steps.passwords.outputs.postgres_password }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Service Schemas" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Schema | User | Secret |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| customer-service | \`customer_service\` | \`customer_user\` | \`postgresql-customer-service\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| property-service | \`property_service\` | \`property_user\` | \`postgresql-property-service\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| loans-service | \`loans_service\` | \`loans_user\` | \`postgresql-loans-service\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| payments-service | \`payments_service\` | \`payments_user\` | \`postgresql-payments-service\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| application-service | \`application_service\` | \`application_user\` | \`postgresql-application-service\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Using in Your Services" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Add to your deployment:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`yaml" >> $GITHUB_STEP_SUMMARY
+          echo "env:" >> $GITHUB_STEP_SUMMARY
+          echo "  - name: ConnectionStrings__DefaultConnection" >> $GITHUB_STEP_SUMMARY
+          echo "    valueFrom:" >> $GITHUB_STEP_SUMMARY
+          echo "      secretKeyRef:" >> $GITHUB_STEP_SUMMARY
+          echo "        name: postgresql-customer-service  # Change per service" >> $GITHUB_STEP_SUMMARY
+          echo "        key: CONNECTION_STRING" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          
+          echo ""
+          echo "════════════════════════════════════════════════════════════"
+          echo "  POSTGRESQL DEPLOYED"
+          echo "════════════════════════════════════════════════════════════"
+          echo ""
+          echo "  Host:     postgresql.${{ github.event.inputs.namespace }}.svc.cluster.local"
+          echo "  Port:     5432"
+          echo "  Database: ${{ env.DB_NAME }}"
+          echo "  Admin:    postgres / ${{ steps.passwords.outputs.postgres_password }}"
+          echo ""
+          echo "  Schemas:"
+          echo "    - customer_service  (user: customer_user)"
+          echo "    - property_service  (user: property_user)"
+          echo "    - loans_service     (user: loans_user)"
+          echo "    - payments_service  (user: payments_user)"
+          echo "    - application_service (user: application_user)"
+          echo ""
+          echo "════════════════════════════════════════════════════════════"
