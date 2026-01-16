@@ -1,4 +1,5 @@
-name: Database Backup/Restore
+name: 10.4
+  Database Backup/Restore
 
 # ============================================================
 # Backup and restore PostgreSQL database
@@ -9,23 +10,23 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: 'Action to perform'
+        description: "Action to perform"
         required: true
         type: choice
         options:
           - backup
           - restore
       namespace:
-        description: 'Namespace'
+        description: "Namespace"
         required: true
-        default: 'mortgage-app'
+        default: "mortgage-app"
       backup_name:
-        description: 'Backup name (for restore, use artifact name)'
+        description: "Backup name (for restore, use artifact name)"
         required: false
-        default: ''
+        default: ""
   schedule:
     # Daily backup at 2 AM UTC
-    - cron: '0 2 * * *'
+    - cron: "0 2 * * *"
 
 env:
   DB_NAME: mortgage_db
@@ -52,31 +53,31 @@ jobs:
       - name: Create Backup
         run: |
           echo "📦 Creating database backup..."
-          
+
           NAMESPACE="${{ github.event.inputs.namespace || 'mortgage-app' }}"
           TIMESTAMP=$(date +%Y%m%d-%H%M%S)
           BACKUP_NAME="mortgage-db-backup-${TIMESTAMP}"
-          
+
           POD=$(oc get pod -n $NAMESPACE -l app=postgresql -o jsonpath='{.items[0].metadata.name}')
-          
+
           if [ -z "$POD" ]; then
             echo "❌ PostgreSQL pod not found"
             exit 1
           fi
-          
+
           echo "Pod: $POD"
           echo "Creating backup: $BACKUP_NAME"
-          
+
           # Create full database dump
           oc exec -n $NAMESPACE $POD -- pg_dump -U postgres -d ${{ env.DB_NAME }} -Fc -f /tmp/backup.dump
-          
+
           # Copy to local
           oc cp $NAMESPACE/$POD:/tmp/backup.dump ./${BACKUP_NAME}.dump
-          
+
           # Also create SQL version for readability
           oc exec -n $NAMESPACE $POD -- pg_dump -U postgres -d ${{ env.DB_NAME }} --schema-only -f /tmp/schema.sql
           oc cp $NAMESPACE/$POD:/tmp/schema.sql ./${BACKUP_NAME}-schema.sql
-          
+
           # Create backup info
           cat <<EOF > ${BACKUP_NAME}-info.txt
           Backup Information
@@ -85,19 +86,19 @@ jobs:
           Database: ${{ env.DB_NAME }}
           Namespace: $NAMESPACE
           Pod: $POD
-          
+
           Schemas included:
           - customer_service
           - property_service
           - loans_service
           - payments_service
           - application_service
-          
+
           Files:
           - ${BACKUP_NAME}.dump (pg_dump custom format)
           - ${BACKUP_NAME}-schema.sql (schema only, readable)
           EOF
-          
+
           ls -la ${BACKUP_NAME}*
           echo "backup_name=$BACKUP_NAME" >> $GITHUB_ENV
 
@@ -157,42 +158,42 @@ jobs:
       - name: Restore Database
         run: |
           echo "🔄 Restoring database from backup..."
-          
+
           NAMESPACE="${{ github.event.inputs.namespace }}"
           POD=$(oc get pod -n $NAMESPACE -l app=postgresql -o jsonpath='{.items[0].metadata.name}')
-          
+
           ls -la ./backup/
-          
+
           DUMP_FILE=$(ls ./backup/*.dump | head -1)
-          
+
           if [ -z "$DUMP_FILE" ]; then
             echo "❌ No .dump file found in backup"
             exit 1
           fi
-          
+
           echo "Restoring from: $DUMP_FILE"
-          
+
           # Copy backup to pod
           oc cp $DUMP_FILE $NAMESPACE/$POD:/tmp/restore.dump
-          
+
           # Restore database
           echo "⚠️ This will overwrite existing data!"
           oc exec -n $NAMESPACE $POD -- pg_restore -U postgres -d ${{ env.DB_NAME }} --clean --if-exists /tmp/restore.dump || {
             echo "⚠️ Some errors during restore (may be normal for clean database)"
           }
-          
+
           echo "✅ Restore complete"
 
       - name: Verify Restore
         run: |
           echo "🔍 Verifying restore..."
-          
+
           NAMESPACE="${{ github.event.inputs.namespace }}"
           POD=$(oc get pod -n $NAMESPACE -l app=postgresql -o jsonpath='{.items[0].metadata.name}')
-          
+
           echo "=== Schemas ==="
           oc exec -n $NAMESPACE $POD -- psql -U postgres -d ${{ env.DB_NAME }} -c "\dn"
-          
+
           echo ""
           echo "=== Tables per Schema ==="
           for SCHEMA in customer_service property_service loans_service payments_service application_service; do

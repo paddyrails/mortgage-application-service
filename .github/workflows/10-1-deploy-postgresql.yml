@@ -1,4 +1,4 @@
-name: Deploy PostgreSQL Database
+name: 10.1 Deploy PostgreSQL Database
 
 # ============================================================
 # Deploys PostgreSQL on OpenShift with separate schemas for
@@ -14,33 +14,33 @@ on:
   workflow_dispatch:
     inputs:
       namespace:
-        description: 'Namespace for PostgreSQL'
+        description: "Namespace for PostgreSQL"
         required: true
-        default: 'mortgage-app'
+        default: "mortgage-app"
       postgres_password:
-        description: 'PostgreSQL admin password (leave empty to auto-generate)'
+        description: "PostgreSQL admin password (leave empty to auto-generate)"
         required: false
-        default: ''
+        default: ""
       storage_size:
-        description: 'Storage size for PostgreSQL'
+        description: "Storage size for PostgreSQL"
         required: true
-        default: '10Gi'
+        default: "10Gi"
         type: choice
         options:
-          - '5Gi'
-          - '10Gi'
-          - '20Gi'
-          - '50Gi'
+          - "5Gi"
+          - "10Gi"
+          - "20Gi"
+          - "50Gi"
       postgres_version:
-        description: 'PostgreSQL version'
+        description: "PostgreSQL version"
         required: true
-        default: '15'
+        default: "15"
         type: choice
         options:
-          - '13'
-          - '14'
-          - '15'
-          - '16'
+          - "13"
+          - "14"
+          - "15"
+          - "16"
 
 env:
   DB_NAME: mortgage_db
@@ -77,14 +77,14 @@ jobs:
           else
             POSTGRES_PASSWORD=$(openssl rand -hex 16)
           fi
-          
+
           # Service passwords
           CUSTOMER_PASSWORD=$(openssl rand -hex 12)
           PROPERTY_PASSWORD=$(openssl rand -hex 12)
           LOANS_PASSWORD=$(openssl rand -hex 12)
           PAYMENTS_PASSWORD=$(openssl rand -hex 12)
           APPLICATION_PASSWORD=$(openssl rand -hex 12)
-          
+
           echo "postgres_password=$POSTGRES_PASSWORD" >> $GITHUB_OUTPUT
           echo "customer_password=$CUSTOMER_PASSWORD" >> $GITHUB_OUTPUT
           echo "property_password=$PROPERTY_PASSWORD" >> $GITHUB_OUTPUT
@@ -95,7 +95,7 @@ jobs:
       - name: Create PostgreSQL Secrets
         run: |
           echo "🔐 Creating secrets..."
-          
+
           # Main PostgreSQL admin secret
           oc create secret generic postgresql-admin \
             --from-literal=POSTGRES_USER=postgres \
@@ -103,7 +103,7 @@ jobs:
             --from-literal=POSTGRES_DB=${{ env.DB_NAME }} \
             -n ${{ github.event.inputs.namespace }} \
             --dry-run=client -o yaml | oc apply -f -
-          
+
           # Per-service secrets with connection strings
           for SERVICE in customer property loans payments application; do
             case $SERVICE in
@@ -135,7 +135,7 @@ jobs:
       - name: Create Init Script ConfigMap
         run: |
           echo "📝 Creating initialization script..."
-          
+
           cat <<'EOF' | oc apply -n ${{ github.event.inputs.namespace }} -f -
           apiVersion: v1
           kind: ConfigMap
@@ -232,7 +232,7 @@ jobs:
               
               echo "✅ Database initialization complete"
           EOF
-          
+
           echo "✅ Init ConfigMap created"
 
       - name: Create Service Account
@@ -243,7 +243,7 @@ jobs:
       - name: Deploy PostgreSQL
         run: |
           echo "📦 Deploying PostgreSQL..."
-          
+
           cat <<EOF | oc apply -n ${{ github.event.inputs.namespace }} -f -
           ---
           apiVersion: v1
@@ -380,34 +380,34 @@ jobs:
               app: postgresql
             type: ClusterIP
           EOF
-          
+
           echo "✅ PostgreSQL deployment created"
 
       - name: Wait for PostgreSQL
         run: |
           echo "⏳ Waiting for PostgreSQL to be ready..."
-          
+
           oc rollout status deployment/postgresql -n ${{ github.event.inputs.namespace }} --timeout=300s || {
             echo "❌ PostgreSQL failed to start"
             oc describe deployment postgresql -n ${{ github.event.inputs.namespace }}
             oc logs -n ${{ github.event.inputs.namespace }} -l app=postgresql --tail=50
             exit 1
           }
-          
+
           echo "✅ PostgreSQL is running"
 
       - name: Run Schema Initialization
         run: |
           echo "🔧 Running schema initialization..."
-          
+
           # Wait for postgres to be fully ready
           sleep 10
-          
+
           POD=$(oc get pod -n ${{ github.event.inputs.namespace }} -l app=postgresql -o jsonpath='{.items[0].metadata.name}')
-          
+
           # Check if schemas already exist
           SCHEMA_COUNT=$(oc exec -n ${{ github.event.inputs.namespace }} $POD -- psql -U postgres -d ${{ env.DB_NAME }} -t -c "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name LIKE '%_service';" 2>/dev/null | tr -d ' ' || echo "0")
-          
+
           if [ "$SCHEMA_COUNT" -lt "5" ]; then
             echo "Running init script..."
             oc exec -n ${{ github.event.inputs.namespace }} $POD -- bash /docker-entrypoint-initdb.d/init-schemas.sh || {
@@ -416,12 +416,12 @@ jobs:
           else
             echo "Schemas already exist ($SCHEMA_COUNT found)"
           fi
-          
+
           # Verify schemas
           echo ""
           echo "=== Verifying Schemas ==="
           oc exec -n ${{ github.event.inputs.namespace }} $POD -- psql -U postgres -d ${{ env.DB_NAME }} -c "\dn"
-          
+
           echo ""
           echo "=== Verifying Users ==="
           oc exec -n ${{ github.event.inputs.namespace }} $POD -- psql -U postgres -d ${{ env.DB_NAME }} -c "\du"
@@ -429,9 +429,9 @@ jobs:
       - name: Test Connections
         run: |
           echo "🧪 Testing service connections..."
-          
+
           POD=$(oc get pod -n ${{ github.event.inputs.namespace }} -l app=postgresql -o jsonpath='{.items[0].metadata.name}')
-          
+
           for SERVICE in customer property loans payments application; do
             USER="${SERVICE}_user"
             SCHEMA="${SERVICE}_service"
@@ -480,7 +480,7 @@ jobs:
           echo "        name: postgresql-customer-service  # Change per service" >> $GITHUB_STEP_SUMMARY
           echo "        key: CONNECTION_STRING" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          
+
           echo ""
           echo "════════════════════════════════════════════════════════════"
           echo "  POSTGRESQL DEPLOYED"

@@ -1,4 +1,4 @@
-name: Delete PostgreSQL Database
+name: 10.2 Delete PostgreSQL Database
 
 # ============================================================
 # Deletes PostgreSQL and all related resources
@@ -8,14 +8,14 @@ on:
   workflow_dispatch:
     inputs:
       namespace:
-        description: 'Namespace where PostgreSQL is deployed'
+        description: "Namespace where PostgreSQL is deployed"
         required: true
-        default: 'mortgage-app'
+        default: "mortgage-app"
       confirm_delete:
         description: 'Type "DELETE" to confirm (data will be lost!)'
         required: true
       delete_pvc:
-        description: 'Delete PVC (permanent data loss!)'
+        description: "Delete PVC (permanent data loss!)"
         required: true
         default: false
         type: boolean
@@ -49,18 +49,18 @@ jobs:
       - name: Delete PostgreSQL Resources
         run: |
           echo "🗑️ Deleting PostgreSQL..."
-          
+
           oc delete deployment postgresql -n ${{ github.event.inputs.namespace }} 2>/dev/null && echo "✅ Deployment deleted" || echo "⚠️ Deployment not found"
           oc delete service postgresql -n ${{ github.event.inputs.namespace }} 2>/dev/null && echo "✅ Service deleted" || echo "⚠️ Service not found"
           oc delete configmap postgresql-init -n ${{ github.event.inputs.namespace }} 2>/dev/null && echo "✅ ConfigMap deleted" || echo "⚠️ ConfigMap not found"
-          
+
           # Delete secrets
           oc delete secret postgresql-admin -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
           for SERVICE in customer property loans payments application; do
             oc delete secret postgresql-${SERVICE}-service -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
           done
           echo "✅ Secrets deleted"
-          
+
           # Delete service account
           oc delete serviceaccount postgresql -n ${{ github.event.inputs.namespace }} 2>/dev/null || true
 

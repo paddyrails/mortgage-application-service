@@ -1,4 +1,4 @@
-name: Run Database Migrations
+name: 10.3 Run Database Migrations
 
 # ============================================================
 # Runs EF Core migrations for a specific microservice
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       service:
-        description: 'Service to migrate'
+        description: "Service to migrate"
         required: true
         type: choice
         options:
@@ -19,13 +19,13 @@ on:
           - payments-service
           - application-service
       namespace:
-        description: 'Namespace'
+        description: "Namespace"
         required: true
-        default: 'mortgage-app'
+        default: "mortgage-app"
       migration_action:
-        description: 'Migration action'
+        description: "Migration action"
         required: true
-        default: 'update'
+        default: "update"
         type: choice
         options:
           - update
@@ -46,7 +46,7 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: "8.0.x"
 
       - name: Install EF Core Tools
         run: dotnet tool install --global dotnet-ef
@@ -68,14 +68,14 @@ jobs:
         run: |
           SERVICE_NAME=$(echo "${{ github.event.inputs.service }}" | sed 's/-service//')
           SECRET_NAME="postgresql-${SERVICE_NAME}-service"
-          
+
           CONN_STRING=$(oc get secret $SECRET_NAME -n ${{ github.event.inputs.namespace }} -o jsonpath='{.data.CONNECTION_STRING}' | base64 -d)
-          
+
           if [ -z "$CONN_STRING" ]; then
             echo "❌ Could not get connection string from secret $SECRET_NAME"
             exit 1
           fi
-          
+
           echo "connection_string=$CONN_STRING" >> $GITHUB_OUTPUT
           echo "✅ Got connection string"
 
@@ -92,33 +92,33 @@ jobs:
           ConnectionStrings__DefaultConnection: ${{ steps.db.outputs.connection_string }}
         run: |
           echo "🚀 Running migrations..."
-          
+
           # Find the project file
           PROJECT=$(find . -name "*.csproj" -type f | head -1)
-          
+
           if [ -z "$PROJECT" ]; then
             echo "❌ No .csproj file found"
             exit 1
           fi
-          
+
           echo "Project: $PROJECT"
-          
+
           # Update connection string to use localhost (port-forwarded)
           export ConnectionStrings__DefaultConnection=$(echo "${{ steps.db.outputs.connection_string }}" | sed 's/Host=postgresql/Host=localhost/')
-          
+
           dotnet ef database update --project "$PROJECT" --verbose
-          
+
           echo "✅ Migrations applied"
 
       - name: Run Migration - Script
         if: github.event.inputs.migration_action == 'script'
         run: |
           echo "📝 Generating migration script..."
-          
+
           PROJECT=$(find . -name "*.csproj" -type f | head -1)
-          
+
           dotnet ef migrations script --project "$PROJECT" --idempotent -o migration.sql
-          
+
           echo "=== Migration Script ==="
           cat migration.sql
 
@@ -128,16 +128,16 @@ jobs:
           ConnectionStrings__DefaultConnection: ${{ steps.db.outputs.connection_string }}
         run: |
           echo "⏪ Rolling back last migration..."
-          
+
           PROJECT=$(find . -name "*.csproj" -type f | head -1)
-          
+
           export ConnectionStrings__DefaultConnection=$(echo "${{ steps.db.outputs.connection_string }}" | sed 's/Host=postgresql/Host=localhost/')
-          
+
           # Get previous migration
           MIGRATIONS=$(dotnet ef migrations list --project "$PROJECT" --no-build 2>/dev/null | tail -5)
           echo "Recent migrations:"
           echo "$MIGRATIONS"
-          
+
           # Rollback to previous
           PREVIOUS=$(echo "$MIGRATIONS" | tail -2 | head -1 | tr -d ' ')
           if [ -n "$PREVIOUS" ]; then
@@ -150,11 +150,11 @@ jobs:
       - name: Verify Schema
         run: |
           echo "🔍 Verifying schema..."
-          
+
           POD=$(oc get pod -n ${{ github.event.inputs.namespace }} -l app=postgresql -o jsonpath='{.items[0].metadata.name}')
           SERVICE_NAME=$(echo "${{ github.event.inputs.service }}" | sed 's/-service//')
           SCHEMA="${SERVICE_NAME}_service"
-          
+
           echo "Tables in ${SCHEMA}:"
           oc exec -n ${{ github.event.inputs.namespace }} $POD -- psql -U postgres -d mortgage_db -c "SELECT table_name FROM information_schema.tables WHERE table_schema = '${SCHEMA}';"
 
